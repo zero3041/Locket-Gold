@@ -1,0 +1,19 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+bot_data.db
+*.log
+*.out
+.venv
+.env
+.env.*
+!.env.example
+avatars/
+demo/
+.coverage
+# Local-only diagnostic dashboard; it has no authentication boundary and is
+# intentionally excluded from deployable source.
+admin_services.py
+
+# git push -u origin main --force
