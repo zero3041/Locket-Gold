@@ -375,6 +375,9 @@ async def cdk_payment_poller(application):
         try:
             expired = db.expire_cdk_orders()
             for order in expired:
+                # Web-store orders have no Telegram chat to notify.
+                if not order.get("chat_id"):
+                    continue
                 try:
                     await application.bot.send_message(
                         chat_id=order["chat_id"],
@@ -383,11 +386,39 @@ async def cdk_payment_poller(application):
                 except Exception:
                     pass
             for order in db.get_pending_cdk_orders()[:SEPAY_MAX_ORDERS_PER_POLL]:
+                # Web-store orders are completed by web_store.py's own poller.
+                if not order.get("chat_id"):
+                    continue
                 lang = db.get_lang(order["user_id"]) or DEFAULT_LANG
                 await _complete_cdk_payment(application, order, lang)
         except Exception as exc:
             logger.error("CDK payment poller error: %s", exc)
         await asyncio.sleep(SEPAY_POLL_INTERVAL_SECONDS)
+
+async def web_activation_poller(application):
+    """Feed paid/free web-store activations into the shared activation queue."""
+    while True:
+        try:
+            for activation in db.list_queued_web_activations(limit=20):
+                if not db.claim_web_activation(activation["id"]):
+                    continue  # Another poller round claimed it first.
+                item = {
+                    'user_id': activation["visitor_id"],
+                    'uid': activation["uid"],
+                    'username': activation["username"],
+                    'chat_id': None,
+                    'message_id': None,
+                    'lang': DEFAULT_LANG,
+                    'cdk': activation.get("cdk_code"),
+                    'cdk_source': 'web',
+                    'web_activation_id': activation["id"],
+                }
+                await request_queue.put(item)
+                print(f"{Clr.BLUE}[Web]{Clr.ENDC} Web activation #{activation['id']} queued: UID={activation['uid']}")
+        except Exception as exc:
+            logger.error("Web activation poller error: %s", exc)
+        await asyncio.sleep(SEPAY_POLL_INTERVAL_SECONDS)
+
 
 async def setlang_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_language_select(update)
@@ -1074,6 +1105,8 @@ async def queue_worker(app, worker_id):
             lang = item['lang']
             cdk_code = item.get('cdk')
             cdk_source = item.get('cdk_source')
+            web_activation_id = item.get('web_activation_id')
+            is_web = web_activation_id is not None
             
             async with queue_lock:
                 if item in pending_items:
@@ -1083,6 +1116,9 @@ async def queue_worker(app, worker_id):
             print(f"{Clr.BLUE}[Worker #{worker_id}][{token_name}] Processing:{Clr.ENDC} UID={uid} | UserID={user_id}")
             
             async def edit(text):
+                if is_web:
+                    db.update_web_activation(web_activation_id, progress=text)
+                    return
                 try:
                     await app.bot.edit_message_text(
                         chat_id=chat_id,
@@ -1100,13 +1136,15 @@ async def queue_worker(app, worker_id):
                         logger.error(f"Edit msg error: {e}")
 
             # Double check limit before processing (unless admin)
-            if user_id != ADMIN_ID and not db.check_can_request(user_id):
+            # Web auto-activations are paid orders — bypass the free daily limit.
+            if not is_web and user_id != ADMIN_ID and not db.check_can_request(user_id):
                 if cdk_code:
                     db.release_cdk(cdk_code, user_id, secret=CDK_SECRET)
                 await edit(T("limit_reached", lang))
                 request_queue.task_done()
                 continue
-            if cdk_code and not db.lock_reserved_cdk(
+            # Web activations carry a freshly generated, non-reserved CDK.
+            if cdk_code and not is_web and not db.lock_reserved_cdk(
                 cdk_code, user_id, secret=CDK_SECRET,
             ):
                 await edit(T("cdk_invalid", lang))
@@ -1127,6 +1165,9 @@ async def queue_worker(app, worker_id):
                     f"{E_LOADING} <b>⚡ SYSTEM EXPLOIT RUNNING...</b>\n"
                     f"<pre>{display_logs}</pre>"
                 )
+                if is_web:
+                    db.update_web_activation(web_activation_id, progress=text)
+                    return
                 try:
                     await app.bot.edit_message_text(
                         chat_id=chat_id,
@@ -1148,12 +1189,16 @@ async def queue_worker(app, worker_id):
             
             if success:
                 if cdk_code:
-                    redeemed = db.redeem_reserved_cdk(cdk_code, user_id, secret=CDK_SECRET)
-                    if not redeemed:
-                        logger.critical("Reserved CDK redemption failed after activation: user_id=%s uid=%s", user_id, uid)
+                    if is_web:
+                        # Web CDK was generated fresh for this order (not reserved).
+                        db.redeem_cdk(cdk_code, user_id, secret=CDK_SECRET)
+                    else:
+                        redeemed = db.redeem_reserved_cdk(cdk_code, user_id, secret=CDK_SECRET)
+                        if not redeemed:
+                            logger.critical("Reserved CDK redemption failed after activation: user_id=%s uid=%s", user_id, uid)
                 db.save_activation(user_id, uid, username)
 
-                if user_id != ADMIN_ID:
+                if user_id != ADMIN_ID and not is_web:
                     db.increment_usage(user_id)
 
                 await notify_admin_success(app, user_id, username, uid, worker_id, token_name)
@@ -1173,6 +1218,19 @@ async def queue_worker(app, worker_id):
                     f"{E_CALENDAR} <b>Plan</b>: Gold (Vĩnh Viễn)\n"
                     f"{dns_text}"
                 )
+
+                if is_web:
+                    db.update_web_activation(
+                        web_activation_id,
+                        status="success",
+                        result=final_msg,
+                        dns_link=link or "",
+                        completed_at=int(time.time()),
+                    )
+                    # Keep the per-token cooldown, then move on.
+                    await asyncio.sleep(45)
+                    request_queue.task_done()
+                    continue
                 
                 await asyncio.sleep(2.0)
                 
@@ -1224,6 +1282,15 @@ async def queue_worker(app, worker_id):
             else:
                 if cdk_code:
                     db.release_cdk(cdk_code, user_id, secret=CDK_SECRET)
+                if is_web:
+                    db.update_web_activation(
+                        web_activation_id,
+                        status="failed",
+                        result=msg_result,
+                        completed_at=int(time.time()),
+                    )
+                    request_queue.task_done()
+                    continue
                 final_msg = f"{T('fail_title', lang)}\nInfo:\n<code>{msg_result}</code>"
                 await edit(final_msg)
                 
@@ -1489,6 +1556,7 @@ def run_bot():
         # Dynamically create workers based on config
         for i in range(1, NUM_WORKERS + 1):
             asyncio.create_task(queue_worker(application, i))
+        asyncio.create_task(web_activation_poller(application))
         if not payment_config_errors():
             asyncio.create_task(cdk_payment_poller(application))
         else:

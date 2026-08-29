@@ -129,6 +129,19 @@ CDK_RESERVATION_TTL_SECONDS = max(
     3600, _env_int("CDK_RESERVATION_TTL_SECONDS", 21600, minimum=3600)
 )
 
+# Web store (web_store.py)
+WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0"
+WEB_PORT = _env_int("WEB_PORT", 8080, minimum=1)
+WEB_ADMIN_USER = os.environ.get("WEB_ADMIN_USER", "admin").strip() or "admin"
+# Prefer a PBKDF2-SHA256 hash (pbkdf2$iterations$salt_b64$hash_b64); plaintext
+# WEB_ADMIN_PASSWORD is still accepted as a fallback (legacy setups).
+WEB_ADMIN_PASSWORD = os.environ.get("WEB_ADMIN_PASSWORD", "").strip()
+WEB_ADMIN_PASSWORD_HASH = os.environ.get("WEB_ADMIN_PASSWORD_HASH", "").strip()
+# Falls back to CDK_SECRET when unset (must stay stable across restarts).
+WEB_SESSION_SECRET = (
+    os.environ.get("WEB_SESSION_SECRET", "").strip() or CDK_SECRET
+)
+
 
 def payment_config_errors():
     required = {

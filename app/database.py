@@ -191,11 +191,34 @@ def init_db():
                     updated_at TEXT,
                     PRIMARY KEY (user_id, locket_uid)
                 )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS web_activations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER,
+                    visitor_id INTEGER,
+                    uid TEXT NOT NULL,
+                    username TEXT,
+                    avatar TEXT,
+                    status TEXT DEFAULT 'awaiting_payment',
+                    cdk_code TEXT,
+                    progress TEXT,
+                    result TEXT,
+                    dns_link TEXT,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    completed_at INTEGER
+                )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS web_paid_uids (
+                    uid TEXT PRIMARY KEY,
+                    order_id INTEGER,
+                    created_at INTEGER
+                )''')
     c.execute("CREATE INDEX IF NOT EXISTS idx_cdk_codes_order_id ON cdk_codes(order_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cdk_codes_available ON cdk_codes(used, reserved_by)")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cdk_codes_code_hash ON cdk_codes(code_hash) WHERE code_hash IS NOT NULL")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cdk_orders_payment_content ON cdk_orders(payment_content) WHERE payment_content IS NOT NULL")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cdk_orders_status_expires ON cdk_orders(status, expires_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_web_activations_status ON web_activations(status)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_web_activations_order_id ON web_activations(order_id)")
     conn.commit()
     conn.close()
 
@@ -845,3 +868,271 @@ def get_recent_cdks(limit=10):
     rows = c.fetchall()
     conn.close()
     return rows
+
+
+def get_cdk_detail(code, secret=None):
+    """Return human-readable CDK status for web verification pages.
+
+    Returns a dict: {"found": bool, "status": "valid"|"used"|"reserved"|"not_found",
+    "source", "used_by", "used_at", "created_at"}.
+    """
+    normalized = _normalize_cdk(code)
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    row = _lookup_cdk_row(c, normalized, secret=secret)
+    conn.close()
+    if not row:
+        return {"found": False, "status": "not_found", "code": normalized}
+    now_ts = _now_ts()
+    reserved_active = (
+        row["reserved_by"] is not None
+        and (row["reserved_until_ts"] is None or row["reserved_until_ts"] > now_ts)
+    )
+    if row["used"]:
+        status = "used"
+    elif reserved_active:
+        status = "reserved"
+    else:
+        status = "valid"
+    return {
+        "found": True,
+        "status": status,
+        "code": normalized,
+        "source": row["source"] or "admin",
+        "used_by": row["used_by"],
+        "used_at": row["used_at"],
+        "created_at": row["created_at"],
+    }
+
+
+def list_cdk_orders(limit=100, status=None):
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if status:
+        c.execute(
+            "SELECT * FROM cdk_orders WHERE status = ? ORDER BY id DESC LIMIT ?",
+            (status, limit),
+        )
+    else:
+        c.execute("SELECT * FROM cdk_orders ORDER BY id DESC LIMIT ?", (limit,))
+    orders = [_row_to_dict(row) for row in c.fetchall()]
+    conn.close()
+    return orders
+
+
+def list_cdk_codes(limit=100, secret=None):
+    """Decoded CDK rows (with codes) for the admin panel."""
+    key = _resolve_cdk_secret(secret=secret)
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        """SELECT code, code_hash, code_nonce, code_version, used, used_by, used_at,
+                  created_at, source, order_id
+           FROM cdk_codes ORDER BY created_ts DESC, rowid DESC LIMIT ?""",
+        (limit,),
+    )
+    rows = []
+    for r in c.fetchall():
+        item = dict(r)
+        if r["code_hash"] and r["code_nonce"]:
+            try:
+                decoded = _code_from_nonce(
+                    r["code_nonce"], secret=key.decode("utf-8"), version=r["code_version"] or 1
+                )
+                if hmac.compare_digest(_code_hash(decoded, secret=key.decode("utf-8")), r["code_hash"]):
+                    item["code"] = decoded
+            except ValueError:
+                pass
+        rows.append(item)
+    conn.close()
+    return rows
+
+
+def cdk_order_stats():
+    conn = _connect()
+    c = conn.cursor()
+    c.execute("SELECT status, COUNT(*) FROM cdk_orders GROUP BY status")
+    counts = {row[0]: row[1] for row in c.fetchall()}
+    c.execute("SELECT COALESCE(SUM(total_price), 0) FROM cdk_orders WHERE status = 'completed'")
+    revenue = c.fetchone()[0]
+    conn.close()
+    return {
+        "total": sum(counts.values()),
+        "pending": counts.get("pending", 0),
+        "completed": counts.get("completed", 0),
+        "expired": counts.get("expired", 0),
+        "canceled": counts.get("canceled", 0),
+        "revenue": revenue or 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Web activations (auto-activate after web payment)
+# ---------------------------------------------------------------------------
+
+def create_web_activation(order_id, visitor_id, uid, username, avatar=None, status="awaiting_payment"):
+    now_ts = _now_ts()
+    conn = _connect()
+    c = conn.cursor()
+    try:
+        c.execute(
+            """INSERT INTO web_activations
+               (order_id, visitor_id, uid, username, avatar, status,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (order_id, visitor_id, uid, username, avatar, status, now_ts, now_ts),
+        )
+        conn.commit()
+        return c.lastrowid
+    finally:
+        conn.close()
+
+
+def get_web_activation(id=None, order_id=None, uid=None):
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if id is not None:
+        c.execute("SELECT * FROM web_activations WHERE id = ?", (id,))
+    elif order_id is not None:
+        c.execute("SELECT * FROM web_activations WHERE order_id = ?", (order_id,))
+    elif uid is not None:
+        c.execute(
+            "SELECT * FROM web_activations WHERE uid = ? ORDER BY id DESC LIMIT 1",
+            (uid,),
+        )
+    else:
+        conn.close()
+        return None
+    row = _row_to_dict(c.fetchone())
+    conn.close()
+    return row
+
+
+def update_web_activation(id, **fields):
+    allowed = {"status", "cdk_code", "progress", "result", "dns_link", "completed_at", "updated_at"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    updates.setdefault("updated_at", _now_ts())
+    conn = _connect()
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        c.execute(
+            f"UPDATE web_activations SET {sets} WHERE id = ?",
+            (*updates.values(), id),
+        )
+        ok = c.rowcount == 1
+        conn.commit()
+        return ok
+    finally:
+        conn.close()
+
+
+def claim_web_activation(id):
+    """Atomically flip a queued activation to processing (bot worker claims it)."""
+    conn = _connect()
+    c = conn.cursor()
+    now_ts = _now_ts()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(
+            """UPDATE web_activations
+               SET status = 'processing', updated_at = ?
+               WHERE id = ? AND status = 'queued'""",
+            (now_ts, id),
+        )
+        ok = c.rowcount == 1
+        conn.commit()
+        return ok
+    finally:
+        conn.close()
+
+
+def list_queued_web_activations(limit=20):
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        """SELECT * FROM web_activations
+           WHERE status = 'queued'
+           ORDER BY id ASC LIMIT ?""",
+        (limit,),
+    )
+    rows = [_row_to_dict(row) for row in c.fetchall()]
+    conn.close()
+    return rows
+
+
+def list_web_activations(limit=50):
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        """SELECT * FROM web_activations ORDER BY id DESC LIMIT ?""",
+        (limit,),
+    )
+    rows = [_row_to_dict(row) for row in c.fetchall()]
+    conn.close()
+    return rows
+
+
+def web_activation_stats():
+    conn = _connect()
+    c = conn.cursor()
+    c.execute("SELECT status, COUNT(*) FROM web_activations GROUP BY status")
+    counts = {row[0]: row[1] for row in c.fetchall()}
+    conn.close()
+    return {
+        "total": sum(counts.values()),
+        "awaiting_payment": counts.get("awaiting_payment", 0),
+        "paid": counts.get("paid", 0),
+        "queued": counts.get("queued", 0),
+        "processing": counts.get("processing", 0),
+        "success": counts.get("success", 0),
+        "failed": counts.get("failed", 0),
+    }
+
+
+def mark_uid_paid(uid, order_id=None):
+    """Record that a Locket UID was paid for once — re-activation is free forever."""
+    conn = _connect()
+    c = conn.cursor()
+    now_ts = _now_ts()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(
+            """INSERT OR IGNORE INTO web_paid_uids (uid, order_id, created_at)
+               VALUES (?, ?, ?)""",
+            (uid, order_id, now_ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_uid_paid(uid):
+    conn = _connect()
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM web_paid_uids WHERE uid = ?", (uid,))
+    ok = c.fetchone() is not None
+    conn.close()
+    return ok
+
+
+def delete_web_activation(id):
+    conn = _connect()
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("DELETE FROM web_activations WHERE id = ?", (id,))
+        ok = c.rowcount == 1
+        conn.commit()
+        return ok
+    finally:
+        conn.close()

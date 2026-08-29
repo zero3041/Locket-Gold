@@ -88,6 +88,16 @@ Required for CDK sales:
 | `CDK_SECRET` | Stable random secret, minimum 32 characters |
 | `ADMIN_ID` | Telegram numeric user ID allowed to generate admin CDKs |
 
+Required for the web store (`web_store.py`):
+
+| Variable | Meaning |
+| :--- | :--- |
+| `WEB_HOST` | Bind address (default `0.0.0.0`) |
+| `WEB_PORT` | Web store port (default `8080`) |
+| `WEB_ADMIN_USER` | Admin panel username (default `admin`) |
+| `WEB_ADMIN_PASSWORD` | Admin panel password — required to enable login |
+| `WEB_SESSION_SECRET` | Optional session signing key; falls back to `CDK_SECRET` |
+
 Generate `CDK_SECRET` once and keep it stable:
 
 ```bash
@@ -130,6 +140,24 @@ Restricted to the `ADMIN_ID` provided through the environment (shown only to the
 | `/rs` | `/rs <id>` | Reset the daily limit for a specific user ID. |
 | `/setdonate` | Reply to photo | Set the custom "Success" image shown after activation. |
 | `/setvideo` | Reply to video | Set the guide video shown in the menu. |
+
+### 🌐 Web Store (`web_store.py`)
+
+A separate sales front running alongside the bot (started automatically by
+`run.sh`, or manually with `./venv/bin/python3 web_store.py`):
+
+*   **Storefront** (`/`) — product showcase, quantity selector, buy flow with
+    VietQR payment. CDK codes are delivered automatically once the bank
+    transfer is confirmed through SePay.
+*   **Verify page** (`/verify`) — paste a CDK to check whether it is valid,
+    already used, or unknown, so buyers can confirm their purchase.
+*   **Admin panel** (`/admin`) — separate username/password login
+    (`WEB_ADMIN_USER` / `WEB_ADMIN_PASSWORD`), showing revenue, order lists,
+    CDK inventory, and CDK generation.
+
+Web orders live in the same `cdk_orders` table and are completed by the web
+store's own SePay poller; the bot skips orders that have no Telegram chat.
+Enable the admin panel by setting `WEB_ADMIN_PASSWORD` in `.env`.
 
 ### ⌨️ Quick Reply Keyboard
 `/start` and `/menu` attach a persistent Reply Keyboard below the input field. Each button maps to the same action as the inline menu button (Input User / Block DNS / Guide / Language / Help / Generate CDK for admin) — no typing needed.
