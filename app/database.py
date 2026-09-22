@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import os
+import re
 import secrets
 from datetime import datetime
 
@@ -164,8 +165,16 @@ def init_db():
         ("reserved_at", "TEXT"),
         ("reserved_at_ts", "INTEGER"),
         ("reserved_until_ts", "INTEGER"),
+        # Multi-use keys: a key can activate up to `spins` Locket accounts.
+        ("spins", "INTEGER DEFAULT 1"),
+        ("spins_left", "INTEGER"),
+        # Plan decides which source pool tier is used (1m / 1y).
+        ("plan", "TEXT DEFAULT '1m'"),
     ])
     _migrate_secure_cdk_plaintext(c)
+    c.execute("UPDATE cdk_codes SET spins = 1 WHERE spins IS NULL")
+    c.execute("UPDATE cdk_codes SET spins_left = 1 WHERE spins_left IS NULL AND used = 0")
+    c.execute("UPDATE cdk_codes SET spins_left = 0 WHERE spins_left IS NULL AND used = 1")
     c.execute('''CREATE TABLE IF NOT EXISTS cdk_orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -182,8 +191,12 @@ def init_db():
                     completed_at INTEGER,
                     canceled_at INTEGER,
                     canceled_by INTEGER,
-                    canceled_chat_id INTEGER
+                    canceled_chat_id INTEGER,
+                    plan TEXT DEFAULT '1m'
                 )''')
+    _ensure_columns(c, "cdk_orders", [
+        ("plan", "TEXT DEFAULT '1m'"),
+    ])
     c.execute('''CREATE TABLE IF NOT EXISTS user_activations (
                     user_id INTEGER,
                     locket_uid TEXT,
@@ -212,6 +225,41 @@ def init_db():
                     order_id INTEGER,
                     created_at INTEGER
                 )''')
+    # Source pool for the alias-based activation engine: each row is a Locket
+    # account that currently has Gold and can donate it up to MAX_SOURCE_SPINS.
+    c.execute('''CREATE TABLE IF NOT EXISTS gold_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    uid TEXT,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    in_flight INTEGER NOT NULL DEFAULT 0,
+                    expires_at TEXT,
+                    expires_ts INTEGER,
+                    last_reserved_ts INTEGER,
+                    created_at INTEGER,
+                    updated_at INTEGER
+                )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS key_redemptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key_code TEXT NOT NULL,
+                    user_id INTEGER,
+                    target TEXT,
+                    target_uid TEXT,
+                    plan TEXT,
+                    status TEXT NOT NULL DEFAULT 'success',
+                    detail TEXT,
+                    created_at INTEGER
+                )''')
+    # Every UID ever activated by the shop — used for free re-activation on web.
+    c.execute('''CREATE TABLE IF NOT EXISTS activated_uids (
+                    uid TEXT PRIMARY KEY,
+                    first_at INTEGER,
+                    last_at INTEGER,
+                    activations INTEGER NOT NULL DEFAULT 0
+                )''')
+    c.execute("CREATE INDEX IF NOT EXISTS idx_gold_sources_pool ON gold_sources(count, in_flight, expires_ts)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_key_redemptions_user ON key_redemptions(user_id, created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_cdk_codes_created_by ON cdk_codes(created_by, used)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cdk_codes_order_id ON cdk_codes(order_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cdk_codes_available ON cdk_codes(used, reserved_by)")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cdk_codes_code_hash ON cdk_codes(code_hash) WHERE code_hash IS NOT NULL")
@@ -329,11 +377,19 @@ def get_stats():
         "unique_users": unique_users
     }
 
-def gen_cdk(count, admin_id, cdk_secret=None, secret=None, source="admin", order_id=None, conn=None):
+def gen_cdk(count, admin_id, cdk_secret=None, secret=None, source="admin", order_id=None, conn=None,
+            plan="1m", spins=1):
     if count <= 0:
         return []
     if source not in ("admin", "purchase"):
         raise ValueError("source must be admin or purchase")
+    plan = (plan or "1m").lower()
+    if plan not in ("1m", "1y"):
+        raise ValueError("plan must be 1m or 1y")
+    try:
+        spins = max(1, int(spins))
+    except (TypeError, ValueError):
+        spins = 1
     key = _resolve_cdk_secret(secret=secret, cdk_secret=cdk_secret)
     owns_conn = conn is None
     if owns_conn:
@@ -350,8 +406,9 @@ def gen_cdk(count, admin_id, cdk_secret=None, secret=None, source="admin", order
         try:
             c.execute(
                 """INSERT INTO cdk_codes
-                   (code, code_hash, code_nonce, code_version, source, created_by, order_id, created_ts)
-                   VALUES (?, ?, ?, 2, ?, ?, ?, ?)""",
+                   (code, code_hash, code_nonce, code_version, source, created_by, order_id,
+                    created_ts, plan, spins, spins_left)
+                   VALUES (?, ?, ?, 2, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     f"HMAC-{hashed}",
                     hashed,
@@ -360,6 +417,9 @@ def gen_cdk(count, admin_id, cdk_secret=None, secret=None, source="admin", order
                     admin_id,
                     order_id,
                     now_ts,
+                    plan,
+                    spins,
+                    spins,
                 ),
             )
             codes.append(code)
@@ -556,9 +616,13 @@ def redeem_cdk(code, user_id, secret=None):
     finally:
         conn.close()
 
-def create_cdk_order(user_id, chat_id, quantity, total_price, payment_content, expires_at=None, transaction_id=None):
+def create_cdk_order(user_id, chat_id, quantity, total_price, payment_content, expires_at=None,
+                     transaction_id=None, plan="1m"):
     if quantity <= 0:
         raise ValueError("quantity must be positive")
+    plan = (plan or "1m").lower()
+    if plan not in ("1m", "1y"):
+        plan = "1m"
     now_ts = _now_ts()
     expires_ts = _parse_ts(expires_at)
     conn = _connect()
@@ -578,10 +642,11 @@ def create_cdk_order(user_id, chat_id, quantity, total_price, payment_content, e
             """SELECT * FROM cdk_orders
                WHERE user_id = ?
                  AND status = 'pending'
+                 AND COALESCE(plan, '1m') = ?
                  AND (expires_at IS NULL OR expires_at > ?)
                ORDER BY created_at ASC, id ASC
                LIMIT 1""",
-            (user_id, now_ts),
+            (user_id, plan, now_ts),
         )
         existing = _row_to_dict(c.fetchone())
         if existing:
@@ -591,8 +656,8 @@ def create_cdk_order(user_id, chat_id, quantity, total_price, payment_content, e
         c.execute(
             """INSERT INTO cdk_orders
                (user_id, chat_id, quantity, total_price, payment_content, transaction_id,
-                status, created_at, updated_at, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
+                status, created_at, updated_at, expires_at, plan)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
             (
                 user_id,
                 chat_id,
@@ -603,6 +668,7 @@ def create_cdk_order(user_id, chat_id, quantity, total_price, payment_content, e
                 now_ts,
                 now_ts,
                 expires_ts,
+                plan,
             ),
         )
         c.execute("SELECT * FROM cdk_orders WHERE id = ?", (c.lastrowid,))
@@ -788,6 +854,7 @@ def complete_cdk_order(order_id=None, transaction_id=None, matched_amount=None, 
             return None
         claimed_transaction_id = transaction_id or order["transaction_id"]
         creator_id = completed_by if completed_by is not None else order["user_id"]
+        order_plan = (order["plan"] if "plan" in order.keys() else None) or "1m"
         codes = gen_cdk(
             order["quantity"],
             admin_id=creator_id,
@@ -795,6 +862,7 @@ def complete_cdk_order(order_id=None, transaction_id=None, matched_amount=None, 
             source="purchase",
             order_id=order["id"],
             conn=conn,
+            plan=order_plan,
         )
         if len(codes) != order["quantity"]:
             conn.rollback()
@@ -895,11 +963,20 @@ def get_cdk_detail(code, secret=None):
         status = "reserved"
     else:
         status = "valid"
+    spins = row["spins"] if row["spins"] is not None else 1
+    spins_left = row["spins_left"]
+    if spins_left is None:
+        spins_left = 0 if row["used"] else spins
+    if status == "valid" and spins_left <= 0:
+        status = "used"
     return {
         "found": True,
         "status": status,
         "code": normalized,
         "source": row["source"] or "admin",
+        "plan": row["plan"] or "1m",
+        "spins": spins,
+        "spins_left": spins_left,
         "used_by": row["used_by"],
         "used_at": row["used_at"],
         "created_at": row["created_at"],
@@ -1136,3 +1213,536 @@ def delete_web_activation(id):
         return ok
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Redeem keys (multi-use keys with a plan: 1m / 1y)
+# ---------------------------------------------------------------------------
+
+MAX_SOURCE_SPINS = 5
+
+
+def _row_to_key(row):
+    if row is None:
+        return None
+    item = _row_to_dict(row)
+    spins = item.get("spins") or 1
+    left = item.get("spins_left")
+    if left is None:
+        left = 0 if item.get("used") else spins
+    item["spins"] = spins
+    item["spins_left"] = left
+    item["plan"] = item.get("plan") or "1m"
+    return item
+
+
+def consume_key(code, user_id=None, secret=None):
+    """Atomically use one spin of a key.
+
+    Returns (ok, message, plan, spins_left, source).
+    """
+    normalized = _normalize_cdk(code)
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    now_ts = _now_ts()
+    now_text = _now_text()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = _lookup_cdk_row(c, normalized, secret=secret)
+        if not row:
+            conn.rollback()
+            return False, "not_found", None, 0, None
+        spins = row["spins"] if row["spins"] is not None else 1
+        left = row["spins_left"]
+        if left is None:
+            left = 0 if row["used"] else spins
+        if spins <= 0 or left <= 0:
+            conn.rollback()
+            return False, "exhausted", row["plan"] or "1m", 0, row["source"]
+        left -= 1
+        c.execute(
+            """UPDATE cdk_codes
+               SET spins_left = ?, used = ?, used_by = ?, used_at = ?, used_at_ts = ?,
+                   reserved_by = NULL, reserved_at = NULL, reserved_at_ts = NULL, reserved_until_ts = NULL
+               WHERE code = ? AND used = 0""",
+            (left, 1 if left == 0 else 0, user_id, now_text, now_ts, row["code"]),
+        )
+        ok = c.rowcount == 1
+        conn.commit()
+        if not ok:
+            return False, "exhausted", row["plan"] or "1m", left, row["source"]
+        return True, "ok", row["plan"] or "1m", left, row["source"]
+    finally:
+        conn.close()
+
+
+def refund_key_spin(code, secret=None):
+    """Give back one unused spin after a failed activation."""
+    normalized = _normalize_cdk(code)
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = _lookup_cdk_row(c, normalized, secret=secret or os.environ.get(CDK_SECRET_ENV))
+        if not row:
+            conn.rollback()
+            return False
+        spins = row["spins"] if row["spins"] is not None else 1
+        left = row["spins_left"]
+        if left is None:
+            left = 0 if row["used"] else spins
+        left = min(spins, left + 1)
+        c.execute(
+            "UPDATE cdk_codes SET spins_left = ?, used = ? WHERE code = ?",
+            (left, 0 if left > 0 else 1, row["code"]),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def mark_uid_activated(uid, when=None):
+    """Record that a Locket UID was successfully activated (enables free re-activation)."""
+    if not uid:
+        return False
+    now_ts = int(when) if when is not None else _now_ts()
+    conn = _connect()
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("SELECT uid FROM activated_uids WHERE uid = ?", (uid,))
+        row = c.fetchone()
+        if row:
+            c.execute(
+                "UPDATE activated_uids SET last_at = ?, activations = activations + 1 WHERE uid = ?",
+                (now_ts, uid),
+            )
+        else:
+            c.execute(
+                "INSERT INTO activated_uids (uid, first_at, last_at, activations) VALUES (?, ?, ?, 1)",
+                (uid, now_ts, now_ts),
+            )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def get_uid_activation(uid):
+    if not uid:
+        return None
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM activated_uids WHERE uid = ?", (uid,)).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def count_free_reactivations(user_id, since_ts):
+    """How many free re-activations a visitor used since `since_ts`."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """SELECT COUNT(*) FROM key_redemptions
+               WHERE user_id = ? AND key_code = 'FREE-REACTIVATE' AND created_at >= ?""",
+            (user_id, int(since_ts)),
+        ).fetchone()
+        return int(row[0] or 0)
+    finally:
+        conn.close()
+
+
+def log_key_redemption(key_code, user_id, target, target_uid, plan, status="success", detail=None):
+    conn = _connect()
+    c = conn.cursor()
+    try:
+        c.execute(
+            """INSERT INTO key_redemptions
+               (key_code, user_id, target, target_uid, plan, status, detail, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (key_code, user_id, target, target_uid, plan, status, detail, _now_ts()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_key_redemptions(user_id=None, limit=20):
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if user_id is None:
+        c.execute("SELECT * FROM key_redemptions ORDER BY id DESC LIMIT ?", (limit,))
+    else:
+        c.execute(
+            "SELECT * FROM key_redemptions WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        )
+    rows = [_row_to_dict(row) for row in c.fetchall()]
+    conn.close()
+    return rows
+
+
+def user_key_stats(user_id):
+    """Unused keys owned by a user plus purchase totals."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        """SELECT plan, COUNT(*) AS n FROM cdk_codes
+           WHERE created_by = ? AND used = 0 AND COALESCE(spins_left, 0) > 0
+           GROUP BY COALESCE(plan, '1m')""",
+        (user_id,),
+    )
+    unused = {row["plan"]: row["n"] for row in c.fetchall()}
+    c.execute(
+        """SELECT COUNT(*) AS n, COALESCE(SUM(quantity), 0) AS qty,
+                  COALESCE(SUM(total_price), 0) AS spent
+           FROM cdk_orders WHERE user_id = ? AND status = 'completed'""",
+        (user_id,),
+    )
+    orders = c.fetchone()
+    c.execute(
+        """SELECT COUNT(*) AS n FROM key_redemptions
+           WHERE user_id = ? AND status = 'success'""",
+        (user_id,),
+    )
+    redeemed = c.fetchone()["n"]
+    conn.close()
+    return {
+        "unused": unused,
+        "unused_total": sum(unused.values()),
+        "orders": orders["n"] if orders else 0,
+        "quantity": orders["qty"] if orders else 0,
+        "spent": orders["spent"] if orders else 0,
+        "redeemed": redeemed or 0,
+    }
+
+
+def list_user_keys(user_id, limit=10):
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        """SELECT code, code_hash, code_nonce, code_version, used, used_at, created_at,
+                  COALESCE(plan, '1m') AS plan, COALESCE(spins, 1) AS spins,
+                  COALESCE(spins_left, 0) AS spins_left
+           FROM cdk_codes
+           WHERE created_by = ? AND used = 0 AND COALESCE(spins_left, 0) > 0
+           ORDER BY created_ts DESC, rowid DESC LIMIT ?""",
+        (user_id, limit),
+    )
+    rows = [_row_to_key(row) for row in c.fetchall()]
+    conn.close()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Gold source pool (alias activation engine)
+# ---------------------------------------------------------------------------
+
+def normalize_source_username(value):
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    for marker, prefix in (
+        ("locket.camera/invites/", ""),
+        ("locket.cam/invites/", ""),
+        ("locket.camera/", ""),
+        ("locket.cam/", ""),
+    ):
+        if marker in lowered:
+            raw = raw.split(marker, 1)[1]
+            break
+    raw = raw.split("?", 1)[0].strip().strip("/").lstrip("@")
+    return raw
+
+
+def parse_expiry_text(value):
+    """Return (epoch_seconds, 'YYYY-MM-DD HH:MM:SS') from a stored expiry string."""
+    if not value:
+        return None, None
+    text = str(value).strip()
+    match = None
+    for pattern in (
+        r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})",
+        r"(\d{4}-\d{2}-\d{2})",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            break
+    if not match:
+        return None, None
+    stamp = match.group(1).replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(stamp, fmt)
+            return int(dt.timestamp()), dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return None, None
+
+
+def days_left_of(expires_ts):
+    if not expires_ts:
+        return 0
+    return max(0, (datetime.fromtimestamp(expires_ts) - datetime.now()).days)
+
+
+def add_gold_source(username, uid=None, count=0, expires=None, min_days=10):
+    """Insert or refresh a source. Returns True when the row changed/added."""
+    name = normalize_source_username(username)
+    if not name or len(name) < 3:
+        return False
+    expires_ts, expires_at = parse_expiry_text(expires)
+    if expires_ts and days_left_of(expires_ts) < min_days:
+        return False
+    now_ts = _now_ts()
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("SELECT * FROM gold_sources WHERE username = ? COLLATE NOCASE", (name,))
+        row = c.fetchone()
+        if row:
+            new_count = max(int(row["count"] or 0), int(count or 0))
+            new_exp = expires_at or row["expires_at"]
+            new_exp_ts = expires_ts or row["expires_ts"]
+            c.execute(
+                """UPDATE gold_sources
+                   SET uid = COALESCE(?, uid), count = ?, expires_at = ?, expires_ts = ?, updated_at = ?
+                   WHERE id = ?""",
+                (uid, new_count, new_exp, new_exp_ts, now_ts, row["id"]),
+            )
+            conn.commit()
+            return True
+        c.execute(
+            """INSERT INTO gold_sources (username, uid, count, in_flight, expires_at, expires_ts, created_at, updated_at)
+               VALUES (?, ?, ?, 0, ?, ?, ?, ?)""",
+            (name, uid, max(0, int(count or 0)), expires_at, expires_ts, now_ts, now_ts),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def gold_source_exists(username):
+    name = normalize_source_username(username)
+    if not name:
+        return False
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM gold_sources WHERE username = ? COLLATE NOCASE", (name,)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def add_gold_source_many(items, min_days=10):
+    """Bulk add from [(username, expires, days_left), ...]. Returns added count."""
+    added = 0
+    for item in items or []:
+        if isinstance(item, (tuple, list)):
+            username = item[0]
+            expires = item[1] if len(item) > 1 else ""
+        else:
+            username, expires = item, ""
+        if add_gold_source(username, expires=expires, min_days=min_days):
+            added += 1
+    return added
+
+
+def list_gold_sources(available_only=False, plan=None):
+    """Sources sorted best-first for the requested plan."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM gold_sources")
+    rows = [_row_to_dict(row) for row in c.fetchall()]
+    conn.close()
+    now_ts = _now_ts()
+    for item in rows:
+        item["days_left"] = days_left_of(item.get("expires_ts"))
+        item["in_flight"] = int(item.get("in_flight") or 0)
+        # A crashed activation must not block a slot forever.
+        if item.get("last_reserved_ts") and now_ts - int(item["last_reserved_ts"]) > 300:
+            item["in_flight"] = 0
+        item["slots_left"] = max(0, MAX_SOURCE_SPINS - int(item.get("count") or 0) - item["in_flight"])
+    if available_only:
+        rows = [r for r in rows if r["slots_left"] > 0]
+    return rows
+
+
+def gold_source_stats():
+    sources = list_gold_sources()
+    total = len(sources)
+    usable = sum(1 for s in sources if s["slots_left"] > 0)
+    expired = sum(1 for s in sources if not s["expires_ts"] or s["days_left"] < 10)
+    return {"total": total, "usable": usable, "expired": expired}
+
+
+def cleanup_gold_sources(min_days=10):
+    """Drop sources that are expired or too close to expiry. Returns removed count."""
+    conn = _connect()
+    c = conn.cursor()
+    now_ts = _now_ts()
+    cutoff = int((datetime.now().timestamp()) + max(0, min_days) * 86400)
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(
+            "DELETE FROM gold_sources WHERE expires_ts IS NOT NULL AND expires_ts < ?",
+            (cutoff,),
+        )
+        removed = c.rowcount
+        conn.commit()
+        return max(0, removed)
+    finally:
+        conn.close()
+
+
+def remove_gold_source(username):
+    name = normalize_source_username(username)
+    conn = _connect()
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("DELETE FROM gold_sources WHERE username = ? COLLATE NOCASE", (name,))
+        ok = c.rowcount == 1
+        conn.commit()
+        return ok
+    finally:
+        conn.close()
+
+
+def reserve_gold_source(plan="1m"):
+    """Pick and reserve the best source slot for a plan. Returns source dict or None."""
+    plan = "1y" if (plan or "").lower() == "1y" else "1m"
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    now_ts = _now_ts()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("SELECT * FROM gold_sources")
+        rows = [dict(row) for row in c.fetchall()]
+        candidates = []
+        for item in rows:
+            in_flight = int(item.get("in_flight") or 0)
+            if item.get("last_reserved_ts") and now_ts - int(item["last_reserved_ts"]) > 300:
+                in_flight = 0
+            slots = MAX_SOURCE_SPINS - int(item.get("count") or 0) - in_flight
+            if slots <= 0:
+                continue
+            item["_in_flight"] = in_flight
+            item["_days"] = days_left_of(item.get("expires_ts"))
+            item["_slots"] = slots
+            candidates.append(item)
+        if not candidates:
+            conn.rollback()
+            return None
+
+        def pick_tier(pool, low, high):
+            tier = [s for s in pool if low <= s["_days"] <= high]
+            if tier:
+                tier.sort(key=lambda s: (s["_days"], -s["_slots"]))
+                return tier[0]
+            return None
+
+        if plan == "1y":
+            selected = pick_tier(candidates, 200, 360) or pick_tier(candidates, 190, 370)
+            if not selected:
+                candidates.sort(key=lambda s: s["_days"], reverse=True)
+                selected = candidates[0]
+        else:
+            selected = pick_tier(candidates, 25, 30) or pick_tier(candidates, 22, 33) or pick_tier(candidates, 15, 60)
+            if not selected:
+                candidates.sort(key=lambda s: (-s["_slots"], -s["_days"]))
+                selected = candidates[0]
+
+        c.execute(
+            """UPDATE gold_sources
+               SET in_flight = ?, last_reserved_ts = ?, updated_at = ?
+               WHERE id = ? AND in_flight = ?""",
+            (selected["_in_flight"] + 1, now_ts, now_ts, selected["id"], selected["_in_flight"]),
+        )
+        if c.rowcount != 1:
+            conn.rollback()
+            return None
+        conn.commit()
+        selected["in_flight"] = selected["_in_flight"] + 1
+        selected["days_left"] = selected["_days"]
+        selected["slots_left"] = selected["_slots"] - 1
+        return selected
+    finally:
+        conn.close()
+
+
+def release_gold_source(source_id, success=False, exhausted=False):
+    """Release a reserved slot; increments count when Gold was delivered or exhausted."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    now_ts = _now_ts()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("SELECT * FROM gold_sources WHERE id = ?", (source_id,))
+        row = c.fetchone()
+        if not row:
+            conn.rollback()
+            return None
+        in_flight = max(0, int(row["in_flight"] or 0) - 1)
+        count = int(row["count"] or 0)
+        if exhausted:
+            count = MAX_SOURCE_SPINS
+        elif success:
+            count = min(MAX_SOURCE_SPINS, count + 1)
+        c.execute(
+            "UPDATE gold_sources SET in_flight = ?, count = ?, updated_at = ? WHERE id = ?",
+            (in_flight, count, now_ts, source_id),
+        )
+        removed = False
+        if exhausted or count >= MAX_SOURCE_SPINS:
+            c.execute("DELETE FROM gold_sources WHERE id = ?", (source_id,))
+            removed = True
+        conn.commit()
+        return {"count": count, "in_flight": in_flight, "removed": removed}
+    finally:
+        conn.close()
+
+
+def import_sources_from_file(path, min_days=10):
+    """One-time import of the legacy current_source.txt pool. Returns added count."""
+    if not path or not os.path.exists(path):
+        return 0
+    added = 0
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("="):
+                    continue
+                parts = [part.strip() for part in line.split("|")]
+                if len(parts) >= 3:
+                    username = parts[1]
+                    try:
+                        count = int(parts[2])
+                    except ValueError:
+                        count = 0
+                    expires = parts[3] if len(parts) >= 4 else ""
+                else:
+                    username, count, expires = parts[0], 0, ""
+                if add_gold_source(username, count=count, expires=expires, min_days=min_days):
+                    added += 1
+    except OSError:
+        return 0
+    return added

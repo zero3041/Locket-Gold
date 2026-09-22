@@ -1,0 +1,4 @@
+# DANH SÁCH NGUỒN LOCKET GOLD
+# FORMAT: STT | USERNAME | SỐ LẦN ĐÃ KÍCH (TỐI ĐA 5 LẦN) | EXPIRES
+=================================================================
+1 | voanhhuyyyyyyyyy | 1 | expires: 2027-08-02 20:39:51 (còn 314 ngày)

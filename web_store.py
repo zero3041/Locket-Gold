@@ -2,17 +2,15 @@
 """Locket Gold — Web Store + Admin Panel.
 
 A self-contained aiohttp web app that reuses the bot's database and SePay
-payment stack to sell CDKs directly on the web:
+payment stack to sell Gold keys directly on the web:
 
-  * Storefront (/): beautiful product page, quantity selector, buy flow.
-  * Order page (/order/<id>): VietQR + bank info, live payment polling,
-    auto-delivery of CDK codes.
-  * Verify page (/verify): paste a CDK, see if it is valid / used / reserved.
-  * Admin panel (/admin): separate login, stats, orders, CDK management.
-
-Web orders are stored in the same cdk_orders table; the bot's Telegram
-poller skips them (chat_id IS NULL) and this app's own poller completes
-them via the shared SePay client.
+  * Storefront (/): product page, plan picker, buy flow with VietQR, direct
+    key redemption (paste key + Locket link) and key verification.
+  * Order page (/order/<id>): VietQR, live payment polling, key delivery and
+    a built-in redeem form.
+  * Verify page (/verify): check whether a key is valid / used / unknown.
+  * Admin panel (/admin): revenue, orders, key generation and the shared Gold
+    source pool used by the alias activation engine.
 """
 
 import asyncio
@@ -37,8 +35,11 @@ from app.config import (
     BANK_OWNER,
     CDK_SECRET,
     CDK_UNIT_PRICE,
+    CDK_UNIT_PRICE_1Y,
+    FREE_REACTIVATE_COOLDOWN_MINUTES,
+    FREE_REACTIVATE_DAILY_MAX,
     CDK_ORDER_TIMEOUT_MINUTES,
-    CDK_RESERVATION_TTL_SECONDS,
+    GOLD_MIN_SOURCE_DAYS,
     SEPAY_API_TOKEN,
     SEPAY_API_URL,
     SEPAY_POLL_INTERVAL_SECONDS,
@@ -49,7 +50,9 @@ from app.config import (
     WEB_PORT,
     WEB_SESSION_SECRET,
     payment_config_errors,
+    plan_label,
 )
+from app.services import activation
 from app.services import locket
 from app.services import sepay
 
@@ -99,7 +102,7 @@ def _fmt_dt(ts):
 
 
 def _gen_payment_content():
-    return "CDK" + secrets.token_hex(8).upper()
+    return "LK" + secrets.token_hex(8).upper()
 
 
 def _visitor_id(request):
@@ -132,6 +135,11 @@ def _build_qr(order):
         return {"ok": False, "error": str(exc)}
 
 
+def _price_for_plan(plan):
+    """Plan price from this module's globals so deploys/tests can override."""
+    return CDK_UNIT_PRICE_1Y if (plan or "").lower() == "1y" else CDK_UNIT_PRICE
+
+
 # ---------------------------------------------------------------------------
 # SePay payment completion (web orders only)
 # ---------------------------------------------------------------------------
@@ -155,22 +163,12 @@ async def _complete_web_order(order_id):
             )
         if not transaction:
             return None
-        codes = db.complete_cdk_order(
+        return db.complete_cdk_order(
             order_id=order_id,
             transaction_id=transaction["id"],
             matched_amount=transaction["amount_in"],
             secret=CDK_SECRET,
         )
-        if codes:
-            activation = db.get_web_activation(order_id=order_id)
-            if activation and activation["status"] == "awaiting_payment":
-                db.mark_uid_paid(activation["uid"], order_id=order_id)
-                db.update_web_activation(
-                    activation["id"],
-                    status="paid",
-                    cdk_code=codes[0],
-                )
-        return codes
     except sepay.SePayError as exc:
         logger.warning("SePay check failed for order %s: %s", order_id, exc)
         return None
@@ -191,7 +189,7 @@ async def web_payment_poller():
                     continue  # Telegram orders are handled by the bot.
                 codes = await _complete_web_order(order["id"])
                 if codes:
-                    logger.info("Web order #%s completed (%s CDK)", order["id"], len(codes))
+                    logger.info("Web order #%s completed (%s keys)", order["id"], len(codes))
         except Exception as exc:
             logger.error("Web payment poller error: %s", exc)
         await asyncio.sleep(SEPAY_POLL_INTERVAL_SECONDS)
@@ -223,7 +221,6 @@ def _read_session(request):
         sig = base64.urlsafe_b64decode(sig_b64 + "=" * (-len(sig_b64) % 4))
     except (ValueError, TypeError):
         return None
-    # Signature is computed over the canonical base64 payload string.
     if not hmac.compare_digest(sig, _sign(payload_b64.encode("ascii"))):
         return None
     try:
@@ -270,13 +267,11 @@ def _verify_admin_password(password):
             iterations = int(iterations)
             salt = base64.urlsafe_b64decode(salt_b64 + "=" * (-len(salt_b64) % 4))
             expected = base64.urlsafe_b64decode(hash_b64 + "=" * (-len(hash_b64) % 4))
-            derived = hashlib.pbkdf2_hmac(
-                "sha256", password.encode("utf-8"), salt, iterations
-            )
+            derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
             return hmac.compare_digest(derived, expected)
         except (ValueError, TypeError, base64.binascii.Error):
             return False
-    return WEB_ADMIN_PASSWORD and hmac.compare_digest(password, WEB_ADMIN_PASSWORD)
+    return bool(WEB_ADMIN_PASSWORD) and hmac.compare_digest(password, WEB_ADMIN_PASSWORD)
 
 
 def _csrf_token(request):
@@ -345,8 +340,6 @@ radial-gradient(700px circle at 85% 30%,rgba(110,168,254,.06),transparent 50%);p
 .logo .mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--gold1),var(--gold3));display:flex;align-items:center;justify-content:center;font-size:18px;color:#201503;box-shadow:0 4px 14px rgba(230,185,79,.4)}
 .nav-links{display:flex;align-items:center;gap:26px;font-size:14.5px;color:var(--muted)}
 .nav-links a:hover{color:var(--gold1)}
-.nav-admin{font-size:13px;color:var(--muted);border:1px solid var(--line);padding:7px 14px;border-radius:10px}
-.nav-admin:hover{color:var(--gold1);border-color:rgba(230,185,79,.4)}
 .section{padding:72px 0}
 .section-tag{color:var(--gold2);font-weight:700;letter-spacing:2px;text-transform:uppercase;font-size:12.5px}
 .section h2{font-size:clamp(26px,4vw,38px);font-weight:800;margin:10px 0 14px;letter-spacing:-.5px}
@@ -358,18 +351,14 @@ radial-gradient(700px circle at 85% 30%,rgba(110,168,254,.06),transparent 50%);p
 .feature .icon{width:46px;height:46px;border-radius:12px;background:rgba(230,185,79,.12);border:1px solid rgba(230,185,79,.25);display:flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:16px}
 .feature h3{font-size:16.5px;margin-bottom:8px}
 .feature p{font-size:14px;color:var(--muted)}
-/* product */
-.product-wrap{display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:center}
-@media(max-width:860px){.product-wrap{grid-template-columns:1fr}}
-.product-visual{position:relative;border-radius:26px;padding:46px 38px;overflow:hidden;background:linear-gradient(160deg,#151a29,#0d1019);border:1px solid rgba(230,185,79,.25)}
-.product-visual::before{content:'';position:absolute;top:-140px;right:-140px;width:380px;height:380px;border-radius:50%;background:radial-gradient(circle,rgba(230,185,79,.22),transparent 65%)}
-.product-card-title{font-size:21px;font-weight:800;margin-bottom:6px}
-.product-price{font-size:46px;font-weight:800;margin:14px 0 4px}
-.product-price small{font-size:16px;color:var(--muted);font-weight:600}
-.product-desc{color:var(--muted);font-size:14.5px;margin:14px 0 22px}
-.buy-box{padding:34px}
-.buy-box h3{font-size:19px;margin-bottom:18px}
-.qty-row{display:flex;align-items:center;gap:14px;margin-bottom:20px}
+.plan-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px}
+.plan-card{padding:30px;text-align:center;transition:.25s}
+.plan-card:hover{transform:translateY(-4px);border-color:rgba(230,185,79,.45)}
+.plan-card .p-name{font-size:17px;font-weight:800}
+.plan-card .p-price{font-size:36px;font-weight:800;margin:12px 0 2px}
+.plan-card .p-price small{font-size:14px;color:var(--muted);font-weight:600}
+.plan-card .p-desc{color:var(--muted);font-size:13.5px;margin:12px 0 20px;min-height:42px}
+.qty-row{display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:20px}
 .qty-btn{width:46px;height:46px;border-radius:12px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:22px;font-weight:700;cursor:pointer;transition:.2s;font-family:inherit}
 .qty-btn:hover{border-color:var(--gold2);color:var(--gold1)}
 .qty-val{font-size:24px;font-weight:800;min-width:44px;text-align:center}
@@ -377,13 +366,11 @@ radial-gradient(700px circle at 85% 30%,rgba(110,168,254,.06),transparent 50%);p
 .total-line .lbl{color:var(--muted);font-size:14px}
 .total-line .amt{font-size:28px;font-weight:800}
 .bank-note{font-size:12.5px;color:var(--muted);margin-top:16px;display:flex;gap:8px;align-items:flex-start}
-/* steps */
 .steps{grid-template-columns:repeat(auto-fit,minmax(240px,1fr));counter-reset:step}
 .step{padding:28px;position:relative}
 .step .num{font-size:38px;font-weight:800;color:rgba(230,185,79,.35);line-height:1}
 .step h3{margin:12px 0 8px;font-size:16px}
 .step p{font-size:14px;color:var(--muted)}
-/* verify */
 .verify-box{max-width:640px;margin:0 auto;text-align:center;padding:40px}
 .verify-input{width:100%;max-width:440px;padding:16px 20px;border-radius:14px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:16px;letter-spacing:1.5px;text-transform:uppercase;font-family:inherit;text-align:center;margin:22px 0 14px}
 .verify-input:focus{outline:none;border-color:var(--gold2)}
@@ -394,7 +381,6 @@ radial-gradient(700px circle at 85% 30%,rgba(110,168,254,.06),transparent 50%);p
 .result-card.info{background:rgba(110,168,254,.08);border:1px solid rgba(110,168,254,.35)}
 .result-card .big{font-size:18px;font-weight:800;margin-bottom:6px}
 .result-card .meta{font-size:13.5px;color:var(--muted)}
-/* order page */
 .order-wrap{max-width:760px;margin:0 auto}
 .order-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:10px}
 .qr-card{display:flex;flex-direction:column;align-items:center;text-align:center;padding:34px;margin-bottom:20px}
@@ -414,14 +400,13 @@ radial-gradient(700px circle at 85% 30%,rgba(110,168,254,.06),transparent 50%);p
 .code-line{display:flex;justify-content:space-between;align-items:center;gap:12px;background:var(--panel2);border:1px solid var(--line);padding:13px 16px;border-radius:12px;margin-bottom:10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:14.5px;letter-spacing:.5px}
 .code-line button{background:rgba(230,185,79,.14);border:1px solid rgba(230,185,79,.35);color:var(--gold1);border-radius:9px;padding:7px 14px;font-size:12.5px;cursor:pointer;font-family:inherit;font-weight:600}
 .code-line button:hover{background:rgba(230,185,79,.25)}
-/* admin */
 .auth-card{max-width:420px;margin:90px auto;padding:40px;text-align:center}
 .auth-card .logo{margin:0 auto 22px;justify-content:center}
 .auth-card form{display:flex;flex-direction:column;gap:14px;margin-top:22px}
 .field{position:relative;text-align:left}
 .field label{display:block;font-size:13px;color:var(--muted);margin-bottom:7px}
-.field input{width:100%;padding:14px 16px;border-radius:12px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:15px;font-family:inherit}
-.field input:focus{outline:none;border-color:var(--gold2)}
+.field input,.field select{width:100%;padding:14px 16px;border-radius:12px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:15px;font-family:inherit}
+.field input:focus,.field select:focus{outline:none;border-color:var(--gold2)}
 .auth-error{background:rgba(255,107,107,.1);border:1px solid rgba(255,107,107,.4);color:var(--red);border-radius:12px;padding:12px 16px;font-size:14px}
 .admin-layout{display:grid;grid-template-columns:230px 1fr;min-height:calc(100vh - 64px);gap:0}
 @media(max-width:860px){.admin-layout{grid-template-columns:1fr}}
@@ -451,15 +436,17 @@ radial-gradient(700px circle at 85% 30%,rgba(110,168,254,.06),transparent 50%);p
 .admin-form .field{flex:1;min-width:180px}
 .gen-result{background:var(--panel2);border:1px solid rgba(61,220,151,.3);border-radius:12px;padding:16px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;white-space:pre-wrap;margin-bottom:24px;display:none}
 .alert{background:rgba(255,107,107,.08);border:1px solid rgba(255,107,107,.35);color:var(--red);border-radius:12px;padding:12px 16px;font-size:14px;margin-bottom:20px}
+.btn-sm{padding:7px 13px;border-radius:10px;font-size:12.5px;font-weight:700;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer;font-family:inherit}
+.btn-sm.danger{color:var(--red);border-color:rgba(255,107,107,.4)}
+.btn-sm:hover{border-color:var(--gold2);color:var(--gold1)}
 footer{border-top:1px solid var(--line);padding:36px 0;text-align:center;color:var(--muted);font-size:13.5px}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
 .pulse{animation:pulse 1.6s infinite}
-/* check-gold flow */
 .check-card{max-width:560px;margin:26px auto 0;background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:10px;display:flex;gap:10px;position:relative;z-index:1}
 .check-card input{flex:1;min-width:0;background:transparent;border:none;outline:none;color:var(--text);font-size:15.5px;padding:8px 14px;font-family:inherit}
 .check-card input::placeholder{color:var(--muted)}
 .check-card .btn{padding:12px 22px}
-#check-result{max-width:560px;margin:16px auto 0;text-align:left;position:relative;z-index:1}
+#check-result{max-width:640px;margin:16px auto 0;text-align:left;position:relative;z-index:1}
 .check-user{display:flex;align-items:center;gap:16px;padding:20px 22px;border-radius:16px;background:var(--panel);border:1px solid var(--line);margin-bottom:14px}
 .check-user img{width:64px;height:64px;border-radius:50%;object-fit:cover;border:2px solid var(--gold2);flex-shrink:0;background:var(--panel2)}
 .check-user .nm{font-weight:800;font-size:17px}
@@ -467,164 +454,10 @@ footer{border-top:1px solid var(--line);padding:36px 0;text-align:center;color:v
 .check-status{display:inline-block;padding:4px 14px;border-radius:99px;font-size:13px;font-weight:700;margin-top:8px}
 .check-status.gold{background:rgba(61,220,151,.12);color:var(--green)}
 .check-status.free{background:rgba(255,107,107,.12);color:var(--red)}
-.check-status.paid{background:rgba(110,168,254,.12);color:var(--blue)}
-.act-console{background:#0a0c12;border:1px solid var(--line);border-radius:14px;padding:16px 18px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;white-space:pre-wrap;max-height:260px;overflow-y:auto;color:#b8c2d8;line-height:1.7;margin-top:14px}
-.act-console .ok{color:var(--green)}
-.act-console .err{color:var(--red)}
-.act-console .ok-card{font-family:'Be Vietnam Pro',system-ui,sans-serif;background:rgba(61,220,151,.08);border:1px solid rgba(61,220,151,.3);border-radius:12px;padding:14px 16px}
-.act-console .ok-card img{border:2px solid var(--green)}
-.act-console .ok-line{margin-top:10px;color:var(--green);font-weight:700;font-size:14px}
-.act-progress{margin-top:18px}
-.act-progress h3{font-size:16px;margin-bottom:10px;display:flex;align-items:center;gap:8px}
-.act-bar{height:12px;border-radius:99px;background:var(--panel2);border:1px solid var(--line);overflow:hidden;margin:12px 0}
-.act-bar>div{height:100%;width:0%;border-radius:99px;background:linear-gradient(90deg,var(--gold1),var(--gold2));transition:width .9s ease}
-.act-bar.step1>div{width:33%}
-.act-bar.step2>div{width:66%}
-.act-bar.step3>div{width:100%}
-.act-bar.done>div{width:100%;background:linear-gradient(90deg,var(--green),#7ee7a8)}
-.act-bar.fail>div{width:100%;background:var(--red)}
-.dns-box{margin-top:18px;padding:22px 20px;border-radius:14px;background:rgba(61,220,151,.07);border:1px solid rgba(61,220,151,.35);text-align:center}
-.dns-box .link{word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;margin-top:8px;user-select:all;background:var(--panel2);padding:10px 12px;border-radius:10px}
-.dns-title{font-size:18px;font-weight:800;color:var(--green)}
-.dns-sub{font-size:13px;color:var(--muted);margin:4px 0 14px}
- .btn-dns{display:flex;width:100%;justify-content:center;align-items:center;gap:8px;padding:16px 20px;border-radius:14px;font-size:17px;font-weight:800;background:linear-gradient(135deg,var(--green),#4fd1a0);color:#04251a;box-shadow:0 8px 28px rgba(61,220,151,.4);cursor:pointer;text-decoration:none;transition:transform .15s ease}
- .btn-dns:hover{transform:translateY(-2px);box-shadow:0 12px 36px rgba(61,220,151,.55);color:#04251a}
- .dns-guide{margin-top:20px;padding:18px;border-radius:14px;background:var(--panel);border:1px solid var(--line);text-align:left}
- .dg-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px}
- .dg-title{font-size:15.5px;font-weight:800;color:var(--text)}
- .dg-tabs{display:flex;gap:8px}
- .dg-tab{padding:8px 14px;border-radius:10px;border:1px solid var(--line);background:var(--panel2);color:var(--muted);font-size:13px;font-weight:700;cursor:pointer;font-family:inherit}
- .dg-tab.active{background:rgba(61,220,151,.12);border-color:rgba(61,220,151,.4);color:var(--green)}
- .dg-view{touch-action:pan-y}
- .dg-img{border-radius:14px;overflow:hidden;border:1px solid var(--line);background:#000;text-align:center}
- .dg-img img{width:auto;max-width:100%;max-height:56vh;object-fit:contain;margin:0 auto;display:block}
- .dg-caption{text-align:center;font-size:14.5px;font-weight:600;margin:12px 0 6px;color:var(--text)}
- .dg-nav{display:flex;align-items:center;justify-content:center;gap:16px}
- .dg-btn{width:38px;height:38px;border-radius:50%;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:16px;cursor:pointer;font-family:inherit;flex:0 0 auto}
- .dg-btn:disabled{opacity:.35;cursor:not-allowed}
- .dg-dots{display:flex;gap:6px}
- .dg-dot{width:8px;height:8px;border-radius:50%;background:var(--line);cursor:pointer;padding:0;border:none}
- .dg-dot.active{background:var(--green);box-shadow:0 0 8px var(--green)}
- .dg-counter{text-align:center;font-size:12px;color:var(--muted);margin-top:6px}
- .dg-tip{margin-top:14px;padding:12px 14px;border-radius:12px;background:rgba(110,168,254,.08);border:1px solid rgba(110,168,254,.3);font-size:13px;color:var(--muted);line-height:1.55}
- .dg-line{margin:8px 0;font-size:14px;color:var(--text);line-height:1.5}
- .dg-host-row{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
- .dg-host{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px 12px;font-size:13.5px;flex:1;min-width:170px;color:var(--text)}
- .dg-copy{padding:9px 14px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:13px;cursor:pointer;font-family:inherit;font-weight:700}
- .dg-copy.ok{background:rgba(61,220,151,.12);border-color:rgba(61,220,151,.4);color:var(--green)}
- @media(max-width:480px){.dg-title{font-size:14px}.dg-tab{padding:7px 10px;font-size:12px}}
-"""
-
-DNS_GUIDE = """
-<div class="dns-guide" id="dns-guide">
-  <div class="dg-head">
-    <div class="dg-title">📖 Hướng dẫn cài DNS — 5 bước</div>
-    <div class="dg-tabs">
-      <button class="dg-tab active" data-os="ios" onclick="dgTab(this)">📱 iPhone</button>
-      <button class="dg-tab" data-os="android" onclick="dgTab(this)">🤖 Android</button>
-    </div>
-  </div>
-  <div class="dg-panel" id="dg-panel-ios">
-    <div class="dg-view" id="dg-view">
-      <div class="dg-img"><img id="dg-photo" src="/static/dns/1.jpeg" alt="Bước 1"></div>
-      <div class="dg-caption" id="dg-caption"></div>
-      <div class="dg-nav">
-        <button class="dg-btn" onclick="dgStep(-1)" aria-label="Bước trước">←</button>
-        <div class="dg-dots" id="dg-dots"></div>
-        <button class="dg-btn" onclick="dgStep(1)" aria-label="Bước sau">→</button>
-      </div>
-      <div class="dg-counter" id="dg-counter"></div>
-    </div>
-    <div class="dg-tip">💡 <b>Mẹo:</b> mở link DNS bằng <b>Safari</b> (không dùng Chrome/Zalo). Không thấy hồ sơ đã tải? Vào <b>Cài đặt → chung → VPN &amp; Quản lý thiết bị</b>.</div>
-  </div>
-  <div class="dg-panel" id="dg-panel-android" style="display:none">
-    <div class="dg-tip" style="margin-top:0">🤖 Trên Android không cài được profile qua link — dùng <b>Private DNS</b>:</div>
-    <div class="dg-line">1️⃣ Mở <b>Cài đặt → Mạng &amp; Internet</b> (một số máy là <b>Kết nối</b>)</div>
-    <div class="dg-line">2️⃣ Bấm vào <b>DNS riêng tư (Private DNS)</b></div>
-    <div class="dg-line">3️⃣ Chọn <b>Tên máy chủ</b> → nhập hostname bên dưới</div>
-    <div class="dg-line">4️⃣ Bấm <b>Lưu</b> — xong ✅</div>
-    <div class="dg-host-row">
-      <input class="dg-host" id="dg-host" value="334513.dns.nextdns.io" readonly onclick="this.select()">
-      <button class="dg-copy" id="dg-copy" onclick="dgCopyHost(this)">📋 Copy</button>
-    </div>
-    <div class="dg-tip" style="border-color:rgba(230,185,79,.35);background:rgba(230,185,79,.07)">⚠️ Nhập <b>đúng hostname</b> (có <b>.dns.nextdns.io</b> ở cuối) và chỉ cài <b>1 DNS</b> — cài nhiều sẽ bị trùng, dễ thu hồi Gold.</div>
-  </div>
-</div>
-<script>
-const DG_STEPS=[
-{img:'/static/dns/1.jpeg',cap:'1️⃣ Nhập tên và bấm <b>Tải</b> — mở link bằng Safari'},
-{img:'/static/dns/2.jpeg',cap:'2️⃣ Bấm <b>Cho phép</b> để tải hồ sơ về'},
-{img:'/static/dns/3.png',cap:'3️⃣ Vào <b>Cài đặt</b> → bấm vào <b>Đã tải về hồ sơ</b>'},
-{img:'/static/dns/4.jpeg',cap:'4️⃣ Bấm <b>Cài đặt</b> và xác nhận'},
-{img:'/static/dns/5.jpeg',cap:'5️⃣ DNS hiển thị ở <b>Giới hạn</b> và <b>Proxy</b> là xong ✅'}];
-let dgI=0,dgX=null;
-function dgRender(){
-  const p=DG_STEPS[dgI];
-  const ph=document.getElementById('dg-photo');
-  if(ph){ph.src=p.img;ph.alt='Bước '+(dgI+1);}
-  const cap=document.getElementById('dg-caption');
-  if(cap)cap.innerHTML=p.cap;
-  const c=document.getElementById('dg-counter');
-  if(c)c.textContent='Bước '+(dgI+1)+' / '+DG_STEPS.length;
-  const dots=document.getElementById('dg-dots');
-  if(dots){
-    dots.innerHTML='';
-    for(let i=0;i<DG_STEPS.length;i++){
-      const d=document.createElement('button');
-      d.className='dg-dot'+(i===dgI?' active':'');
-      d.setAttribute('aria-label','Bước '+(i+1));
-      d.onclick=(function(n){return function(){dgI=n;dgRender();};})(i);
-      dots.appendChild(d);
-    }
-  }
-  const btns=document.querySelectorAll('#dns-guide .dg-btn');
-  if(btns.length){btns[0].disabled=(dgI===0);btns[1].disabled=(dgI===DG_STEPS.length-1);}
-}
-function dgStep(d){
-  dgI=Math.min(DG_STEPS.length-1,Math.max(0,dgI+d));
-  dgRender();
-}
-function dgTab(btn){
-  const os=btn.getAttribute('data-os');
-  const pi=document.getElementById('dg-panel-ios');
-  const pa=document.getElementById('dg-panel-android');
-  if(!pi||!pa)return;
-  pi.style.display=(os==='ios')?'block':'none';
-  pa.style.display=(os==='android')?'block':'none';
-  const tabs=document.querySelectorAll('#dns-guide .dg-tab');
-  for(let i=0;i<tabs.length;i++)tabs[i].className='dg-tab'+(tabs[i]===btn?' active':'');
-}
-function dgCopyHost(btn){
-  const host=document.getElementById('dg-host');
-  const done=function(){btn.textContent='✅ Copied';btn.classList.add('ok');setTimeout(function(){btn.textContent='📋 Copy';btn.classList.remove('ok');},1500);};
-  if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(host.value).then(done,function(){done();});
-  }else{
-    host.select();host.setSelectionRange(0,host.value.length);
-    try{document.execCommand('copy');}catch(e){}
-    done();
-  }
-}
-function dgSetLink(link){
-  if(!link)return;
-  const m=String(link).match(/profile=([A-Za-z0-9]+)/);
-  if(!m)return;
-  const h=document.getElementById('dg-host');
-  if(h)h.value=m[1]+'.dns.nextdns.io';
-}
-(function(){
-  const v=document.getElementById('dg-view');
-  if(!v)return;
-  v.addEventListener('touchstart',function(e){dgX=e.touches[0].clientX;},{passive:true});
-  v.addEventListener('touchend',function(e){
-    if(dgX===null)return;
-    const dx=e.changedTouches[0].clientX-dgX;
-    dgX=null;
-    if(Math.abs(dx)>40)dgStep(dx<0?1:-1);
-  },{passive:true});
-})();
-dgRender();
-</script>
+.redeem-box{max-width:680px;margin:0 auto;padding:36px}
+.redeem-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
+.redeem-row input{flex:1;min-width:200px;padding:14px 16px;border-radius:12px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:15px;font-family:inherit}
+.redeem-row input:focus{outline:none;border-color:var(--gold2)}
 """
 
 
@@ -653,19 +486,36 @@ def nav_bar(active=""):
 <a class="logo" href="/"><span class="mark">👑</span>Locket <span class="gold-text">Gold</span></a>
 <div class="nav-links">
 <a href="/#products" {'class="active"' if active=="shop" else ""}>Sản phẩm</a>
-<a href="/verify">Kiểm tra CDK</a>
+<a href="/#redeem">Kích hoạt Key</a>
+<a href="/verify">Kiểm tra Key</a>
 </div></div></nav>"""
+
+
+def _product_card(disabled=False):
+    price = _price_for_plan("1m")
+    button = (
+        '<button class="btn btn-gold" style="width:100%;justify-content:center" disabled>Cửa hàng tạm đóng</button>'
+        if disabled
+        else '<button class="btn btn-gold" style="width:100%;justify-content:center" onclick="buyPlan(this)">💳 Mua Gói Vĩnh Viễn</button>'
+    )
+    return f"""<div class="card plan-card">
+<div class="p-name">👑 Gói Vĩnh Viễn</div>
+<div class="p-price">{format_vnd(price)} <small>/ key</small></div>
+<div class="p-desc">1 key kích hoạt Gold cho 1 tài khoản Locket.<br>
+💡 Nếu Gold rớt sau một thời gian dài sử dụng, vui lòng vào web bấm <b>Kích hoạt lại miễn phí</b>.</div>
+{button}
+<p class="bank-note" style="justify-content:center">Mua 1 lần — kích hoạt lại miễn phí trên web khi Gold rớt.</p>
+</div>"""
 
 
 def landing_page():
     errors = payment_config_errors()
-    shop_disabled = bool(errors) or CDK_UNIT_PRICE <= 0
-    price = CDK_UNIT_PRICE
-    body = f"""{nav_bar()}
+    shop_disabled = bool(errors) or _price_for_plan("1m") <= 0
+    body = f"""{nav_bar('shop')}
 <section class="hero"><div class="container">
-<span class="pill">✨ Kích hoạt tự động — không cần bot</span>
+<span class="pill">✨ Mua key &amp; kích hoạt tự động</span>
 <h1 style="margin-top:20px">Bật <span class="gold-text">Locket Gold</span><br>chỉ trong vài phút</h1>
-<p class="sub">Nhập username Locket của bạn, kiểm tra tình trạng Gold, thanh toán và hệ thống sẽ <b>tự động kích hoạt</b> — hoàn toàn không cần thao tác thêm.</p>
+<p class="sub">Mua key bằng VietQR, nhận key tự động, rồi kích hoạt Gold cho tài khoản Locket của bạn — ngay trên web hoặc qua bot Telegram với <b>/redeem</b>.</p>
 
 <div class="check-card">
   <input id="check-username" placeholder="Username Locket hoặc link locket.cam/..." autocomplete="off" spellcheck="false">
@@ -674,73 +524,58 @@ def landing_page():
 <div id="check-result"></div>
 
 <div class="hero-badges">
-<span class="badge"><span class="dot"></span>Kích hoạt tự động 100%</span>
+<span class="badge"><span class="dot"></span>Nhận key tự động 24/7</span>
 <span class="badge"><span class="dot"></span>Thanh toán VietQR</span>
-<span class="badge"><span class="dot"></span>Bảo hành 100%</span>
-<span class="badge"><span class="dot"></span>Hỗ trợ 24/7</span>
+<span class="badge"><span class="dot"></span>Kích hoạt tức thì</span>
 </div></div></section>
 
 <section class="section" id="products"><div class="container">
 <div class="section-tag">Sản phẩm</div>
-<h2>Gói kích hoạt <span class="gold-text">Gold vĩnh viễn</span></h2>
-<p class="lead">Thanh toán một lần, Gold kích hoạt vĩnh viễn cho tài khoản của bạn. Kích hoạt lại sau này hoàn toàn miễn phí.</p>
-<div class="product-wrap">
-  <div class="product-visual">
-    <div class="product-card-title">👑 Locket Gold — <span class="gold-text">Vĩnh viễn</span></div>
-    <div class="product-price">{format_vnd(price)} <small>/ 1 tài khoản</small></div>
-    <div class="product-desc">
-      • Kiểm tra tình trạng Gold trước khi thanh toán<br>
-      • Tự động kích hoạt sau khi chuyển khoản<br>
-      • Kèm hướng dẫn cài DNS chống mất Gold<br>
-      • Bảo hành — lỗi 1 đổi 1 trong 24h
-    </div>
-    <span class="pill">⭐ 4.9/5 — hơn 1.000 lượt mua</span>
+<h2>Gói <span class="gold-text">Vĩnh Viễn</span></h2>
+<p class="lead">Mỗi key kích hoạt Gold cho 1 tài khoản Locket. Key hiển thị ngay sau khi ngân hàng xác nhận chuyển khoản. Nếu Gold rớt sau thời gian dài sử dụng, vào web kích hoạt lại — <b>miễn phí</b> cho tài khoản đã từng kích hoạt.</p>
+<div class="plan-grid" id="plan-cards">
+{_product_card(shop_disabled)}
+</div>
+<div class="card redeem-box" id="redeem" style="margin-top:26px">
+  <div class="section-tag">Đã có key?</div>
+  <h2 style="font-size:26px;margin-top:8px">Kích hoạt Gold ngay</h2>
+  <p class="lead" style="margin:8px 0 0">Dán key và username Locket của bạn. Hệ thống kích hoạt trực tiếp, kết quả hiển thị ngay bên dưới.</p>
+  <div class="redeem-row">
+    <input id="redeem-code" placeholder="Key: LK-GOLD-XXXXXX hoặc LOCK-..." autocomplete="off" spellcheck="false">
+    <input id="redeem-username" placeholder="Username hoặc link locket.cam/..." autocomplete="off" spellcheck="false">
+    <button class="btn btn-gold" id="redeem-btn" onclick="redeemKey()">🚀 Kích hoạt</button>
   </div>
-  <div class="card buy-box">
-    <h3>👑 Kích hoạt Gold của bạn</h3>
-    <p class="lead" style="margin:0 0 14px;font-size:14px">Nhập username Locket ở ô trên, hệ thống sẽ kiểm tra tình trạng và đưa bạn đến bước thanh toán.</p>
-    <div class="total-line"><span class="lbl">Giá kích hoạt</span><span class="amt gold-text">{format_vnd(price)}</span></div>
-    <button class="btn btn-gold" style="width:100%;justify-content:center" onclick="location.href='/#check-username';document.getElementById('check-username').focus()">🚀 Bắt đầu kích hoạt</button>
-    {'<p class="bank-note">⚠️ Cửa hàng tạm đóng do thiếu cấu hình thanh toán. Liên hệ admin qua Telegram.</p>' if shop_disabled else '<p class="bank-note">💡 Đã có Gold trước đây? Kích hoạt lại miễn phí, không tốn thêm chi phí.</p>'}
-  </div>
-</div></div></section>
+  <div id="redeem-result" style="margin-top:16px"></div>
+</div>
+</div></section>
 
 <section class="section" style="padding-top:0"><div class="container">
 <div class="section-tag">Vì sao chọn chúng tôi</div>
 <h2>Tại sao <span class="gold-text">Locket Gold</span>?</h2>
-<p class="lead">Hệ thống bán hàng tự động, chuyên nghiệp và đáng tin cậy nhất hiện nay.</p>
 <div class="grid features">
-  <div class="card feature"><div class="icon">⚡</div><h3>Kích hoạt tức thì</h3><p>Hệ thống tự động kích hoạt Gold ngay khi ngân hàng xác nhận giao dịch — không cần chờ admin, không cần bot.</p></div>
+  <div class="card feature"><div class="icon">⚡</div><h3>Kích hoạt tức thì</h3><p>Kích hoạt ngay sau khi thanh toán hoặc bằng key có sẵn — không cần chờ đợi.</p></div>
   <div class="card feature"><div class="icon">🏦</div><h3>VietQR chuẩn</h3><p>Chuyển khoản qua mã QR ngân hàng, hệ thống đối soát tự động theo nội dung và số tiền.</p></div>
-  <div class="card feature"><div class="icon">🛡️</div><h3>Chống mất Gold</h3><p>Kèm hướng dẫn cài DNS chặn để Gold không bị thu hồi sau vài ngày.</p></div>
-  <div class="card feature"><div class="icon">🔒</div><h3>Kích hoạt lại miễn phí</h3><p>Đã mua một lần, kích hoạt lại bất cứ lúc nào mà không phải trả thêm bất kỳ chi phí nào.</p></div>
+  <div class="card feature"><div class="icon">🎟️</div><h3>Key đa nền tảng</h3><p>Dùng key trên web hoặc gửi cho khách/bạn bè kích hoạt qua bot Telegram bằng /redeem.</p></div>
+  <div class="card feature"><div class="icon">🛡️</div><h3>Nguồn chăm sóc tự động</h3><p>Kho nguồn được kiểm tra định kỳ, tự loại nguồn hết hạn hoặc chạm giới hạn.</p></div>
   <div class="card feature"><div class="icon">💬</div><h3>Hỗ trợ 24/7</h3><p>Kênh Telegram luôn sẵn sàng giải đáp mọi thắc mắc sau khi mua hàng.</p></div>
-  <div class="card feature"><div class="icon">🤝</div><h3>Bảo hành 1-đổi-1</h3><p>Sản phẩm lỗi được đổi mã mới trong vòng 24h — uy tín đặt lên hàng đầu.</p></div>
+  <div class="card feature"><div class="icon">🤝</div><h3>Hoàn key khi lỗi</h3><p>Nếu kích hoạt thất bại, lượt key được hoàn lại tự động — bạn không mất gì.</p></div>
 </div></div></section>
 
 <section class="section" style="padding-top:0"><div class="container">
 <div class="section-tag">Hướng dẫn</div>
 <h2>Chỉ 3 bước <span class="gold-text">đơn giản</span></h2>
-<p class="lead">Từ khi kiểm tra đến khi có Gold chỉ mất vài phút.</p>
 <div class="grid steps">
-  <div class="card step"><div class="num">01</div><h3>Nhập username</h3><p>Nhập username Locket hoặc dán link hồ sơ locket.cam để kiểm tra tình trạng Gold.</p></div>
-  <div class="card step"><div class="num">02</div><h3>Chuyển khoản</h3><p>Quét mã QR hoặc chuyển khoản đúng số tiền + nội dung hiển thị.</p></div>
-  <div class="card step"><div class="num">03</div><h3>Gold tự động bật</h3><p>Hệ thống tự nhận thanh toán và kích hoạt Gold — bạn chỉ cần mở lại ứng dụng Locket.</p></div>
+  <div class="card step"><div class="num">01</div><h3>Mua key</h3><p>Chọn gói 1 tháng hoặc 1 năm và chuyển khoản theo mã VietQR.</p></div>
+  <div class="card step"><div class="num">02</div><h3>Nhận key</h3><p>Key hiện ngay trên trang đơn hàng sau khi ngân hàng xác nhận (3-10 giây).</p></div>
+  <div class="card step"><div class="num">03</div><h3>Kích hoạt</h3><p>Dán key + username Locket và bấm kích hoạt — hoặc dùng <b>/redeem key link</b> trên bot.</p></div>
 </div></div></section>
-
-<section class="section" style="padding-top:0"><div class="container">
-<div class="section-tag">Chống mất Gold</div>
-<h2>Hướng dẫn cài <span class="gold-text">DNS</span> — 5 bước</h2>
-<p class="lead">Bắt buộc cài sau khi kích hoạt để Gold không bị thu hồi. Vuốt ngang để xem từng bước, chọn đúng thiết bị của bạn.</p>
-{DNS_GUIDE}
-</div></section>
 
 <section class="section" style="padding-top:0"><div class="container">
 <div class="card verify-box">
 <div class="section-tag">Kiểm tra mã</div>
-<h2 style="font-size:26px">Xác minh CDK đã mua</h2>
-<p class="lead" style="margin:8px auto 0">Bạn đã mua CDK? Dán mã vào đây để kiểm tra trạng thái.</p>
-<input class="verify-input" id="verify-code" placeholder="LOCK-XXXXXXXX-XXXX-XXXX" autocomplete="off" spellcheck="false">
+<h2 style="font-size:26px">Xác minh key đã mua</h2>
+<p class="lead" style="margin:8px auto 0">Dán key vào đây để kiểm tra trạng thái và số lượt còn lại.</p>
+<input class="verify-input" id="verify-code" placeholder="LK-GOLD-XXXXXX" autocomplete="off" spellcheck="false">
 <button class="btn btn-gold" onclick="verify()" style="justify-content:center">🔍 Kiểm tra</button>
 <div id="verify-result"></div>
 </div></div></section>
@@ -748,8 +583,11 @@ def landing_page():
 <footer><div class="container">© 2026 Locket Gold — Kích hoạt Gold Locket tự động. Mọi thắc mắc liên hệ kênh Telegram chính thức.</div></footer>
 
 <script>
-const PRICE={price};
+const PRICES={{'1m':{_price_for_plan('1m')},'1y':{_price_for_plan('1y')}}};
 function esc(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}}
+function vnd(n){{return Number(n).toLocaleString('vi-VN').replace(/,/g,'.')+'đ';}}
+let currentUser=null;
+
 async function checkGold(){{
   const input=document.getElementById('check-username');
   const btn=document.getElementById('check-btn');
@@ -763,72 +601,86 @@ async function checkGold(){{
     const r=await fetch('/api/check',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{username:username}})}});
     const d=await r.json();
     if(!r.ok||!d.ok)throw new Error(d.error||'Lỗi hệ thống');
-    const avatar=d.avatar?'<img src="'+d.avatar+'" alt="avatar" onerror="this.style.display=\\'none\\'">':'<div style="width:64px;height:64px;border-radius:50%;background:var(--panel2);display:flex;align-items:center;justify-content:center;font-size:26px">👤</div>';
-    const saved=d.activation&&d.activation.status==='success';
-    const never=(!d.activation)&&!d.paid;
-    const uname=esc(d.username), uuid=esc(d.uid), uav=esc(d.avatar||'');
-    const dataAttr='data-uid="'+uuid+'" data-name="'+uname+'" data-avatar="'+uav+'"';
+    currentUser=d;
+    const avatar=d.avatar?'<img src="'+esc(d.avatar)+'" alt="avatar" onerror="this.style.display=\\'none\\'">':'<div style="width:64px;height:64px;border-radius:50%;background:var(--panel2);display:flex;align-items:center;justify-content:center;font-size:26px">👤</div>';
+    const status=d.gold_active
+      ? '<div class="check-status gold">✅ Đã có Gold'+(d.expires?' — hết hạn: '+esc(d.expires):'')+'</div>'
+      : '<div class="check-status free">⏳ Chưa có Gold</div>';
+    let action='';
+    const reactivateBtn=d.can_reactivate
+      ? '<button class="btn btn-gold" style="width:100%;justify-content:center;margin-top:14px" data-name="'+esc(d.username)+'" onclick="reactivate(this)">⚡ Kích hoạt lại miễn phí</button>'
+      : '';
     if(d.gold_active){{
-      const glabel=d.paid?'⚡ Kích hoạt lại miễn phí':'⚡ Kích hoạt ngay — '+PRICE.toLocaleString('vi-VN').replace(/,/g,'.')+'đ';
-      box.innerHTML='<div class="check-user">'+avatar+'<div><div class="nm">'+uname+'</div><div class="uid">'+uuid+'</div><div class="check-status gold">✅ Đã có Gold'+(d.expires?' — hết hạn: '+d.expires:'')+'</div></div></div>'
-        +'<div class="result-card ok"><div class="big">🎉 Tài khoản của bạn đã có Gold!</div><div>Không cần mua thêm. Nếu Gold bị thu hồi, kích hoạt lại bất cứ lúc nào.</div></div>'
-        +'<button class="btn btn-gold" style="width:100%;justify-content:center" '+dataAttr+' onclick="activate(this)">'+glabel+'</button>';
-    }}else if(saved){{
-      box.innerHTML='<div class="check-user">'+avatar+'<div><div class="nm">'+uname+'</div><div class="uid">'+uuid+'</div><div class="check-status gold">✅ Đã kích hoạt Gold thành công</div></div></div>'
-        +'<div class="result-card ok"><div class="big">🎉 Tài khoản đã được kích hoạt</div>'
-        +'<div class="meta">CDK đã dùng: <b>'+esc(d.activation.cdk_code)+'</b></div>'
-        +(d.activation.dns_link?'<a class="btn btn-dns" style="margin-top:14px" href="'+esc(d.activation.dns_link)+'" target="_blank" rel="noopener">📲 Cài DNS chống mất Gold (mở tab mới)</a>':'')
-        +'<div>Gold bị thu hồi? Kích hoạt lại miễn phí bất cứ lúc nào.</div></div>'
-        +'<button class="btn btn-gold" style="width:100%;justify-content:center" '+dataAttr+' onclick="activate(this)">⚡ Kích hoạt lại miễn phí</button>';
-      if(d.activation.dns_link)dgSetLink(d.activation.dns_link);
-    }}else if(never){{
-      box.innerHTML='<div class="check-user">'+avatar+'<div><div class="nm">'+uname+'</div><div class="uid">'+uuid+'</div><div class="check-status free">⏳ Chưa có Gold</div></div></div>'
-        +'<div class="result-card info"><div class="big">👤 User này chưa từng mua và kích hoạt</div><div class="meta">Hệ thống chưa có hồ sơ kích hoạt nào cho tài khoản <b>'+uname+'</b>.</div></div>'
-        +'<button class="btn btn-gold" style="width:100%;justify-content:center;margin-top:16px" '+dataAttr+' onclick="activate(this)">💳 Mua Gold — '+PRICE.toLocaleString('vi-VN').replace(/,/g,'.')+'đ</button>'
-        +'<button class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:10px" onclick="toggleCdk(this)">🎟️ Tôi đã có CDK — kích hoạt bằng CDK</button>'
-        +'<div class="cdk-row" style="display:none;margin-top:12px"><input class="verify-input" id="cdk-code" placeholder="LOCK-XXXXXXXX-XXXX-XXXX" autocomplete="off" spellcheck="false"><button class="btn btn-gold" style="width:100%;justify-content:center;margin-top:8px" '+dataAttr+' onclick="activateCdk(this)">✅ Kích hoạt bằng CDK</button><div id="cdk-result" style="margin-top:10px"></div></div>';
+      action='<div class="result-card ok"><div class="big">🎉 Tài khoản này đã có Gold!</div><div class="meta">Bạn chưa cần mua key. Nếu Gold rớt sau thời gian dài sử dụng, quay lại đây bấm "Kích hoạt lại miễn phí".</div></div>'+reactivateBtn;
+    }}else if(d.can_reactivate){{
+      action='<div class="result-card info"><div class="big">🔄 Tài khoản đã từng kích hoạt</div><div class="meta">Bạn được kích hoạt lại <b>miễn phí</b> (không cần mua key mới).</div></div>'+reactivateBtn;
     }}else{{
-      const label=d.paid?'Kích hoạt lại miễn phí':'Kích hoạt ngay — '+PRICE.toLocaleString('vi-VN').replace(/,/g,'.')+'đ';
-      const paidCard='<div class="check-user">'+avatar+'<div><div class="nm">'+uname+'</div><div class="uid">'+uuid+'</div><div class="check-status '+(d.paid?'paid':'free')+'">'+(d.paid?'🔄 Đã mua trước đây — kích hoạt lại miễn phí':'⏳ Chưa có Gold')+'</div></div></div>';
-      box.innerHTML=paidCard
-        +(d.paid?'<button class="btn btn-gold" style="width:100%;justify-content:center" '+dataAttr+' onclick="activate(this)">⚡ '+label+'</button>'
-        :'<button class="btn btn-gold" style="width:100%;justify-content:center;margin-top:16px" '+dataAttr+' onclick="activate(this)">💳 Mua Gold — '+PRICE.toLocaleString('vi-VN').replace(/,/g,'.')+'đ</button>'
-          +'<button class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:10px" onclick="toggleCdk(this)">🎟️ Tôi đã có CDK — kích hoạt bằng CDK</button>'
-          +'<div class="cdk-row" style="display:none;margin-top:12px"><input class="verify-input" id="cdk-code" placeholder="LOCK-XXXXXXXX-XXXX-XXXX" autocomplete="off" spellcheck="false"><button class="btn btn-gold" style="width:100%;justify-content:center;margin-top:8px" '+dataAttr+' onclick="activateCdk(this)">✅ Kích hoạt bằng CDK</button><div id="cdk-result" style="margin-top:10px"></div></div>');
+      action='<div class="result-card info"><div class="meta">Tài khoản chưa có Gold. Chọn gói bên dưới hoặc dán key có sẵn vào ô "Đã có key?".</div></div>';
     }}
+    box.innerHTML='<div class="check-user">'+avatar+'<div><div class="nm">'+esc(d.username)+'</div><div class="uid">'+esc(d.uid)+'</div>'+status+'</div></div>'+action;
+    const ru=document.getElementById('redeem-username');
+    if(ru&&!ru.value)ru.value=username;
   }}catch(e){{
-    box.innerHTML='<div class="result-card bad"><div class="big">⚠️ Không tìm thấy tài khoản</div><div class="meta">'+e.message+' — Kiểm tra lại username hoặc link hồ sơ Locket của bạn.</div></div>';
+    box.innerHTML='<div class="result-card bad"><div class="big">⚠️ Không tìm thấy tài khoản</div><div class="meta">'+esc(e.message)+' — Kiểm tra lại username hoặc link hồ sơ Locket.</div></div>';
   }}
   btn.disabled=false;btn.textContent='🔍 Kiểm tra';
 }}
-async function activate(btn){{
-  const uid=btn.getAttribute('data-uid'), username=btn.getAttribute('data-name'), avatar=btn.getAttribute('data-avatar')||'';
+
+async function buyPlan(btn){{
+  const qty=parseInt(prompt('Số lượng key (1-5):','1')||'0',10);
+  if(!qty||qty<1||qty>5){{if(qty!==0)alert('Số lượng 1-5');return;}}
+  btn.disabled=true;const old=btn.textContent;btn.textContent='⏳ Đang tạo đơn...';
   try{{
-    const r=await fetch('/api/activate',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{uid:uid,username:username,avatar:avatar}})}});
+    const r=await fetch('/api/order',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{plan:'1m',quantity:qty}})}});
     const d=await r.json();
     if(!r.ok||!d.ok)throw new Error(d.error||'Lỗi hệ thống');
-    if(d.free)location.href='/activate/'+d.activation_id;
-    else location.href='/order/'+d.order_id;
-  }}catch(e){{alert(e.message);}}
+    location.href='/order/'+d.order_id;
+  }}catch(e){{alert(e.message);btn.disabled=false;btn.textContent=old;}}
 }}
-function toggleCdk(btn){{
-  const row=btn.parentElement.querySelector('.cdk-row');
-  if(row)row.style.display=row.style.display==='none'?'block':'none';
-}}
-async function activateCdk(btn){{
-  const uid=btn.getAttribute('data-uid'), username=btn.getAttribute('data-name'), avatar=btn.getAttribute('data-avatar')||'';
-  const row=btn.parentElement, input=row.querySelector('#cdk-code'), res=row.querySelector('#cdk-result');
-  const code=input.value.trim();
-  if(!code){{res.innerHTML='<div class="result-card bad"><div class="big">⚠️ Nhập mã CDK</div></div>';return;}}
-  btn.disabled=true;btn.textContent='⏳ Đang xử lý CDK...';
-  res.innerHTML='<div class="result-card info"><div class="big">⏳ Đang xác minh CDK...</div></div>';
+
+async function reactivate(btn){{
+  const username=btn.getAttribute('data-name');
+  const box=document.getElementById('check-result');
+  if(!username)return;
+  btn.disabled=true;const old=btn.textContent;btn.textContent='⏳ Đang kích hoạt lại...';
+  box.innerHTML+='<div class="result-card info" id="reactivate-result"><div class="big">⏳ Đang kích hoạt lại Gold...</div><div class="meta">Quá trình có thể mất 10-40 giây.</div></div>';
   try{{
-    const r=await fetch('/api/activate-cdk',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{uid:uid,username:username,avatar:avatar,code:code}})}});
+    const r=await fetch('/api/reactivate',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{username:username}})}});
     const d=await r.json();
     if(!r.ok||!d.ok)throw new Error(d.error||'Lỗi hệ thống');
-    location.href='/activate/'+d.activation_id;
-  }}catch(e){{res.innerHTML='<div class="result-card bad"><div class="big">❌ '+esc(e.message||'Lỗi hệ thống')+'</div><div class="meta">Mã sai, đã dùng, hoặc đang được người khác giữ. Kiểm tra lại mã CDK của bạn.</div></div>';btn.disabled=false;btn.textContent='✅ Kích hoạt bằng CDK';}}
+    document.getElementById('reactivate-result').className='result-card ok';
+    document.getElementById('reactivate-result').innerHTML='<div class="big">🎉 KÍCH HOẠT LẠI THÀNH CÔNG</div>'
+      +'<div>User: <b>'+esc(d.username)+'</b><br>Hạn Gold: <b>'+esc(d.expires||'—')+'</b>'+(d.days_left?' (còn '+d.days_left+' ngày)':'')+'</div>'
+      +'<div class="meta" style="margin-top:8px">Kích hoạt lại miễn phí cho tài khoản đã từng mua. Nếu Gold rớt tiếp, quay lại đây bấm lại.</div>';
+  }}catch(e){{
+    document.getElementById('reactivate-result').className='result-card bad';
+    document.getElementById('reactivate-result').innerHTML='<div class="big">❌ Kích hoạt lại thất bại</div><div class="meta">'+esc(e.message)+'</div>';
+  }}
+  btn.disabled=false;btn.textContent=old;
 }}
+
+async function redeemKey(){{
+  const code=document.getElementById('redeem-code').value.trim();
+  const username=document.getElementById('redeem-username').value.trim();
+  const btn=document.getElementById('redeem-btn');
+  const box=document.getElementById('redeem-result');
+  if(!code||!username){{alert('Nhập key và username Locket');return;}}
+  btn.disabled=true;btn.textContent='⏳ Đang kích hoạt...';
+  box.innerHTML='<div class="result-card info"><div class="big">⏳ Đang kích hoạt Gold, vui lòng chờ...</div><div class="meta">Quá trình có thể mất 10-40 giây.</div></div>';
+  try{{
+    const r=await fetch('/api/redeem',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{code:code,username:username}})}});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw new Error(d.error||'Lỗi hệ thống');
+    box.innerHTML='<div class="result-card ok"><div class="big">🎉 KÍCH HOẠT THÀNH CÔNG</div>'
+      +'<div>User: <b>'+esc(d.username)+'</b><br>UID: <span class="mono">'+esc(d.uid)+'</span><br>'
+      +'Hạn Gold: <b>'+esc(d.expires||'—')+'</b>'+(d.days_left?' (còn '+d.days_left+' ngày)':'')+'<br>'
+      +'Key còn <b>'+d.spins_left+'</b> lượt.</div></div>';
+  }}catch(e){{
+    box.innerHTML='<div class="result-card bad"><div class="big">❌ Kích hoạt thất bại</div><div class="meta">'+esc(e.message)+'</div></div>';
+  }}
+  btn.disabled=false;btn.textContent='🚀 Kích hoạt';
+}}
+
 async function verify(){{
   const code=document.getElementById('verify-code').value.trim();
   const box=document.getElementById('verify-result');
@@ -837,21 +689,21 @@ async function verify(){{
   try{{
     const r=await fetch('/api/verify',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{code:code}})}});
     const d=await r.json();
-    if(d.status==='valid')box.innerHTML='<div class="result-card ok"><div class="big">✅ CDK hợp lệ</div><div>Mã <b>'+d.code+'</b> còn sử dụng được. Nhập vào bot để kích hoạt Gold.</div></div>';
-    else if(d.status==='used')box.innerHTML='<div class="result-card bad"><div class="big">❌ CDK đã được sử dụng</div><div class="meta">Đã kích hoạt lúc: '+d.used_at+'</div></div>';
-    else if(d.status==='reserved')box.innerHTML='<div class="result-card info"><div class="big">⏳ CDK đang được giữ</div><div class="meta">Đơn hàng đang xử lý. Thử lại sau ít phút.</div></div>';
-    else box.innerHTML='<div class="result-card bad"><div class="big">⚠️ Không tìm thấy CDK</div><div class="meta">Mã không tồn tại hoặc sai định dạng. Kiểm tra lại mã của bạn.</div></div>';
-  }}catch(e){{box.innerHTML='<div class="result-card bad"><div class="big">⚠️ Lỗi kiểm tra</div><div class="meta">'+e.message+'</div></div>';}}
+    const planName=d.plan==='1y'?'1 Năm':'1 Tháng';
+    if(d.status==='valid')box.innerHTML='<div class="result-card ok"><div class="big">✅ Key hợp lệ</div><div>Mã <b>'+esc(d.code)+'</b> — gói <b>'+planName+'</b>, còn <b>'+d.spins_left+'/'+d.spins+'</b> lượt.<br>Dán key vào ô "Đã có key?" để kích hoạt.</div></div>';
+    else if(d.status==='used')box.innerHTML='<div class="result-card bad"><div class="big">❌ Key đã dùng hết lượt</div><div class="meta">Dùng lần cuối: '+esc(d.used_at||'—')+'</div></div>';
+    else if(d.status==='reserved')box.innerHTML='<div class="result-card info"><div class="big">⏳ Key đang được giữ</div><div class="meta">Đơn hàng đang xử lý. Thử lại sau ít phút.</div></div>';
+    else box.innerHTML='<div class="result-card bad"><div class="big">⚠️ Không tìm thấy key</div><div class="meta">Mã không tồn tại hoặc sai định dạng.</div></div>';
+  }}catch(e){{box.innerHTML='<div class="result-card bad"><div class="big">⚠️ Lỗi kiểm tra</div><div class="meta">'+esc(e.message)+'</div></div>';}}
 }}
 </script>"""
-    return page("Locket Gold — Kích hoạt Gold tự động", body)
+    return page("Locket Gold — Mua key & kích hoạt Gold tự động", body)
 
 
 def order_page(order):
     qr = _build_qr(order)
     expires_ms = (order["expires_at"] or 0) * 1000
-    activation = db.get_web_activation(order_id=order["id"])
-    is_activation = activation is not None
+    plan = order.get("plan") or "1m"
     bank = [
         ("Ngân hàng", BANK_NAME),
         ("Chủ tài khoản", BANK_OWNER),
@@ -863,20 +715,22 @@ def order_page(order):
         f'<div class="v mono" style="user-select:all">{html.escape(str(v))}</div></div>'
         for k, v in bank
     )
-    qr_html = f'<img src="{html.escape(qr["url"])}" alt="VietQR" loading="lazy">' if qr["ok"] else \
-        f'<div class="result-card bad" style="width:100%">⚠️ {html.escape(qr["error"])}</div>'
-    status = order["status"]
+    qr_html = (
+        f'<img src="{html.escape(qr["url"])}" alt="VietQR" loading="lazy">'
+        if qr["ok"]
+        else f'<div class="result-card bad" style="width:100%">⚠️ {html.escape(qr["error"])}</div>'
+    )
     body = f"""{nav_bar()}
 <section class="section"><div class="container order-wrap">
 <div class="order-head">
   <div><div class="section-tag">Đơn hàng #{order['id']}</div>
-  <h2 style="margin-top:6px">Thanh toán <span class="gold-text">{'kích hoạt Gold' if is_activation else 'CDK'}</span></h2></div>
-  <span class="pill">{'Kích hoạt tự động' if is_activation else 'Giao hàng tự động'}</span>
+  <h2 style="margin-top:6px">Thanh toán <span class="gold-text">Key {plan_label(plan, 'VI')}</span></h2></div>
+  <span class="pill">Giao key tự động</span>
 </div>
 
 <div class="card qr-card">
   <div class="qr-amount">{format_vnd(order['total_price'])}</div>
-  <div style="color:var(--muted);font-size:14px">{'Kích hoạt vĩnh viễn 1 tài khoản Locket' if is_activation else f"Số lượng: {order['quantity']} CDK"}</div>
+  <div style="color:var(--muted);font-size:14px">Gói {plan_label(plan, 'VI')} — {order['quantity']} key</div>
   {qr_html}
   <div class="qr-content">{html.escape(order['payment_content'])}</div>
 </div>
@@ -885,83 +739,62 @@ def order_page(order):
 
 <div id="countdown" class="countdown">⏳ Đang kiểm tra thanh toán…</div>
 <div class="codes-box card" id="codes-box">
-  <h3>✅ THANH TOÁN THÀNH CÔNG — {'hệ thống đang tự động kích hoạt Gold cho bạn!' if is_activation else 'CDK của bạn:'}</h3>
+  <h3>✅ THANH TOÁN THÀNH CÔNG — KEY CỦA BẠN:</h3>
   <div id="codes-list"></div>
-  <p class="bank-note">💡 {'Quá trình kích hoạt mất khoảng 1-2 phút. Bạn không cần làm gì thêm — Gold sẽ tự động bật trong Locket.' if is_activation else 'Nhập từng mã vào bot Telegram để kích hoạt Gold. Mỗi mã chỉ dùng được một lần.'}</p>
-</div>
-<div class="act-progress" id="act-progress" style="display:none">
-  <h3 id="act-title" class="pulse">⚡ Hệ thống đang kích hoạt Gold...</h3>
-  <div class="act-bar" id="act-bar"><div></div></div>
-  <div class="act-console" id="act-console"></div>
-  <div class="dns-box" id="dns-box" style="display:none">
-    <div class="dns-title">🌐 CÀI DNS CHỐNG MẤT GOLD</div>
-    <div class="dns-sub">Bắt buộc — cài xong Gold sẽ không bị thu hồi.</div>
-    <a class="btn btn-dns" id="dns-link" href="#" target="_blank" rel="noopener">📲 Bấm để cài DNS (mở tab mới)</a>
-    {DNS_GUIDE}
+  <p class="bank-note">💡 Kích hoạt ngay bên dưới, hoặc gửi key cho khách và dùng lệnh <b>/redeem &lt;key&gt; &lt;link_locket&gt;</b> trên bot Telegram.<br>Nếu Gold rớt sau thời gian dài sử dụng, vào lại web và bấm <b>Kích hoạt lại miễn phí</b>.</p>
+  <div class="redeem-row">
+    <input id="order-redeem-username" placeholder="Username hoặc link Locket cần kích hoạt" autocomplete="off" spellcheck="false">
+    <button class="btn btn-gold" id="order-redeem-btn" onclick="redeemFromOrder()">🚀 Kích hoạt ngay</button>
   </div>
+  <div id="order-redeem-result" style="margin-top:14px"></div>
 </div>
-<div class="status-tip" id="status-tip">{'Chuyển khoản đúng số tiền và nội dung ở trên. Gold sẽ tự động được kích hoạt sau khi ngân hàng xác nhận.' if is_activation else 'Chuyển khoản đúng số tiền và nội dung ở trên. Đơn tự động giao CDK khi ngân hàng xác nhận.'}</div>
+<div class="status-tip" id="status-tip">Chuyển khoản đúng số tiền và nội dung ở trên. Key được giao tự động khi ngân hàng xác nhận.</div>
 </div></section>
 <footer><div class="container">© 2026 Locket Gold — Đơn #{order['id']}</div></footer>
 
 <script>
 const ORDER_ID={order['id']}, EXPIRES={expires_ms};
-const HAS_ACTIVATION={'true' if is_activation else 'false'};
+let FIRST_CODE=null;
 function esc(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}}
 const countdown=document.getElementById('countdown'), codesBox=document.getElementById('codes-box');
 function tick(){{
   const left=EXPIRES-Date.now();
-  if(left<=0){{countdown.innerHTML='⌛ Đơn đã hết hạn. Kiểm tra lại tài khoản để tạo đơn mới.';return true;}}
+  if(left<=0){{countdown.innerHTML='⌛ Đơn đã hết hạn. Tạo đơn mới nếu chưa thanh toán.';return true;}}
   const m=Math.floor(left/60000),s=Math.floor(left%60000/1000);
   countdown.innerHTML='⏳ Đơn hết hạn sau <b>'+m+'</b> phút <b>'+String(s).padStart(2,'0')+'</b> giây';
   return false;}}
 function renderCodes(codes){{
+  if(!codes||!codes.length)return;
+  FIRST_CODE=FIRST_CODE||codes[0];
   document.getElementById('codes-list').innerHTML=codes.map(function(c){{
-    return '<div class="code-line"><span>'+c+'</span><button data-copy="'+c+'">Copy</button></div>';
+    return '<div class="code-line"><span>'+esc(c)+'</span><button data-copy="'+esc(c)+'">Copy</button></div>';
   }}).join('');
-codesBox.style.display='block';
+  codesBox.style.display='block';
   countdown.className='countdown ok';countdown.innerHTML='✅ Thanh toán thành công!';
   document.getElementById('status-tip').style.display='none';
 }}
-function renderActivation(a){{
-  const box=document.getElementById('act-progress');
-  if(!a||a.status==='not_found')return;
-  if(a.status==='success'){{
-    box.style.display='block';
-    document.getElementById('act-bar').className='act-bar done';
-    document.getElementById('act-title').innerHTML='🎉 KÍCH HOẠT THÀNH CÔNG — GOLD ĐÃ BẬT!';
-    document.getElementById('act-title').className='';
-    const av=a.avatar?'<img src="'+esc(a.avatar)+'" alt="" onerror="this.style.display=\\'none\\'" style="width:52px;height:52px;border-radius:50%;object-fit:cover;flex:0 0 auto">':'<div style="width:52px;height:52px;border-radius:50%;background:var(--panel2);display:flex;align-items:center;justify-content:center;font-size:22px;flex:0 0 auto">👤</div>';
-    document.getElementById('act-console').innerHTML='<div class="ok-card"><div style="display:flex;gap:14px;align-items:center">'+av+'<div><div style="font-weight:700;font-size:16px">'+esc(a.username||'')+'</div><div style="font-size:12.5px;color:#8a94ad">UID: '+esc(a.uid||'')+'</div></div></div><div class="ok-line">✨ Gold vĩnh viễn đã được bật thành công trên tài khoản của bạn!</div></div>';
-    if(a.dns_link){{document.getElementById('dns-link').href=a.dns_link;document.getElementById('dns-box').style.display='block';dgSetLink(a.dns_link);}}
-    clearInterval(window.__timer);return;
-  }}
-  if(a.status==='failed'){{
-    document.getElementById('act-bar').className='act-bar fail';
-    document.getElementById('act-title').innerHTML='❌ Kích hoạt thất bại';
-    document.getElementById('act-title').className='';
-    document.getElementById('act-console').innerHTML='<span class="err">'+(a.result||'Lỗi không xác định')+'</span><br><br><a class="btn btn-gold" style="justify-content:center" href="/#check-username">🔄 Thử lại (miễn phí)</a>';
-    clearInterval(window.__timer);return;
-  }}
-  box.style.display='block';
-  const p=(a.progress||'').toLowerCase();
-  document.getElementById('act-bar').className='act-bar '+(p.indexOf('thành công')>-1?'done':(p.indexOf('dns')>-1||p.indexOf('xong')>-1?'step3':(p.indexOf('đang kích')>-1||p.indexOf('exploit')>-1?'step2':'step1')));
-  document.getElementById('act-console').innerHTML=(a.progress||'').replace(/</g,'&lt;').replace(/\\n/g,'<br>')||'<span class="pulse">⏳ Đang xếp hàng xử lý...</span>';
+async function redeemFromOrder(){{
+  const username=document.getElementById('order-redeem-username').value.trim();
+  const btn=document.getElementById('order-redeem-btn');
+  const box=document.getElementById('order-redeem-result');
+  if(!FIRST_CODE){{box.innerHTML='<div class="result-card bad"><div class="big">⚠️ Chưa có key</div></div>';return;}}
+  if(!username){{alert('Nhập username hoặc link Locket');return;}}
+  btn.disabled=true;btn.textContent='⏳ Đang kích hoạt...';
+  box.innerHTML='<div class="result-card info"><div class="big">⏳ Đang kích hoạt Gold...</div></div>';
+  try{{
+    const r=await fetch('/api/redeem',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{code:FIRST_CODE,username:username}})}});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw new Error(d.error||'Lỗi hệ thống');
+    box.innerHTML='<div class="result-card ok"><div class="big">🎉 KÍCH HOẠT THÀNH CÔNG</div><div>User: <b>'+esc(d.username)+'</b><br>Hạn Gold: <b>'+esc(d.expires||'—')+'</b>'+(d.days_left?' (còn '+d.days_left+' ngày)':'')+'</div></div>';
+  }}catch(e){{box.innerHTML='<div class="result-card bad"><div class="big">❌ Thất bại</div><div class="meta">'+esc(e.message)+'</div></div>';}}
+  btn.disabled=false;btn.textContent='🚀 Kích hoạt ngay';
 }}
 async function poll(){{
   if(tick()&&!window.__done)return;
   try{{
     const r=await fetch('/api/order/'+ORDER_ID);const d=await r.json();
-    if(d.status==='completed'){{
-      if(d.codes)renderCodes(d.codes);
-      window.__done=true;
-      if(HAS_ACTIVATION==='true'&&d.activation){{
-        location.href='/activate/'+d.activation.id;return;
-      }}
-      clearInterval(window.__timer);return;
-    }}
-    if(d.status==='expired'){{countdown.innerHTML='⌛ Đơn đã hết hạn. Kiểm tra lại tài khoản để tạo đơn mới.';window.__done=true;clearInterval(window.__timer);}}
-    if(HAS_ACTIVATION==='true'&&d.activation&&d.activation.status!=='awaiting_payment')renderActivation(d.activation);
+    if(d.status==='completed'){{renderCodes(d.codes);window.__done=true;clearInterval(window.__timer);return;}}
+    if(d.status==='expired'){{countdown.innerHTML='⌛ Đơn đã hết hạn.';window.__done=true;clearInterval(window.__timer);}}
   }}catch(e){{}}
 }}
 window.__timer=setInterval(poll,4000);poll();
@@ -969,101 +802,32 @@ window.__timer=setInterval(poll,4000);poll();
     return page(f"Đơn #{order['id']} — Locket Gold", body)
 
 
-def activation_page(activation):
-    uid = activation["uid"]
-    username = activation["username"] or uid
-    avatar = activation.get("avatar") or ""
-    avatar_html = f'<img src="{html.escape(avatar)}" alt="avatar" onerror="this.style.display=\'none\'">' if avatar else \
-        '<div style="width:64px;height:64px;border-radius:50%;background:var(--panel2);display:flex;align-items:center;justify-content:center;font-size:26px">👤</div>'
-    body = f"""{nav_bar()}
-<section class="section"><div class="container order-wrap">
-<div class="order-head">
-  <div><div class="section-tag">Kích hoạt Gold</div>
-  <h2 style="margin-top:6px">Đang kích hoạt <span class="gold-text">Gold</span></h2></div>
-  <span class="pill">{'✅ Đã thanh toán bằng CDK' if not activation.get('order_id') else '✅ Đã thanh toán'}</span>
-</div>
-
-<div class="check-user" style="justify-content:center;margin-bottom:20px">{avatar_html}<div><div class="nm">{html.escape(username)}</div><div class="uid">{html.escape(uid)}</div></div></div>
-
-<div class="act-progress" id="act-progress">
-  <h3 id="act-title" class="pulse">⏳ Đang xếp hàng xử lý...</h3>
-  <div class="act-bar" id="act-bar"><div></div></div>
-  <div class="act-console" id="act-console"></div>
-  <div class="dns-box" id="dns-box" style="display:none">
-    <div class="dns-title">🌐 CÀI DNS CHỐNG MẤT GOLD</div>
-    <div class="dns-sub">Bắt buộc — cài xong Gold sẽ không bị thu hồi.</div>
-    <a class="btn btn-dns" id="dns-link" href="#" target="_blank" rel="noopener">📲 Bấm để cài DNS (mở tab mới)</a>
-    {DNS_GUIDE}
-  </div>
-</div>
-</div></section>
-<footer><div class="container">© 2026 Locket Gold — Kích hoạt #{activation['id']}</div></footer>
-
-<script>
-const ACT_ID={activation['id']};
-const HAS_ORDER={'true' if activation.get('order_id') else 'false'};
-function esc(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}}
-function notify(title, body){{
-  try{{if('Notification' in window&&Notification.permission==='granted')new Notification(title,{{body:body,icon:'https://locket.gold/icon.png'}});}}catch(e){{}}
-}}
-if('Notification' in window&&Notification.permission==='default')Notification.requestPermission();
-async function startIfNeeded(){{
-  if(HAS_ORDER!=='true')return;
-  try{{
-    const r=await fetch('/api/order/{activation['order_id'] or 0}/start',{{method:'POST'}});
-    const d=await r.json();
-    if(d&&d.status==='queued'){{document.getElementById('act-console').innerHTML='<span class="pulse">⏳ Đang xếp hàng xử lý...</span>';}}
-  }}catch(e){{}}
-}}
-function renderActivation(a){{
-  const box=document.getElementById('act-progress');
-  if(!a||a.status==='not_found')return;
-  if(a.status==='success'){{
-    document.getElementById('act-bar').className='act-bar done';
-    document.getElementById('act-title').innerHTML='🎉 KÍCH HOẠT THÀNH CÔNG — GOLD ĐÃ BẬT!';
-    document.getElementById('act-title').className='';
-    const av=a.avatar?'<img src="'+esc(a.avatar)+'" alt="" onerror="this.style.display=\\'none\\'" style="width:52px;height:52px;border-radius:50%;object-fit:cover;flex:0 0 auto">':'<div style="width:52px;height:52px;border-radius:50%;background:var(--panel2);display:flex;align-items:center;justify-content:center;font-size:22px;flex:0 0 auto">👤</div>';
-    document.getElementById('act-console').innerHTML='<div class="ok-card"><div style="display:flex;gap:14px;align-items:center">'+av+'<div><div style="font-weight:700;font-size:16px">'+esc(a.username||'')+'</div><div style="font-size:12.5px;color:#8a94ad">UID: '+esc(a.uid||'')+'</div></div></div><div class="ok-line">✨ Gold vĩnh viễn đã được bật thành công trên tài khoản của bạn!</div></div>';
-    if(a.dns_link){{document.getElementById('dns-link').href=a.dns_link;document.getElementById('dns-box').style.display='block';dgSetLink(a.dns_link);}}
-    notify('✅ Kích hoạt thành công','Gold của bạn đã được bật!');
-    clearInterval(window.__timer);return;
-  }}
-  if(a.status==='failed'){{
-    document.getElementById('act-bar').className='act-bar fail';
-    document.getElementById('act-title').innerHTML='❌ Kích hoạt thất bại';
-    document.getElementById('act-title').className='';
-    document.getElementById('act-console').innerHTML='<span class="err">'+(a.result||'Lỗi không xác định')+'</span><br><br><a class="btn btn-gold" style="justify-content:center" href="/">🔄 Thử lại (miễn phí)</a>';
-    clearInterval(window.__timer);return;
-  }}
-  const p=(a.progress||'').toLowerCase();
-  document.getElementById('act-bar').className='act-bar '+(p.indexOf('thành công')>-1?'done':(p.indexOf('dns')>-1||p.indexOf('xong')>-1?'step3':(p.indexOf('đang kích')>-1||p.indexOf('exploit')>-1?'step2':'step1')));
-  document.getElementById('act-console').innerHTML=(a.progress||'').replace(/</g,'&lt;').replace(/\\n/g,'<br>')||'<span class="pulse">⏳ Đang xếp hàng xử lý...</span>';
-}}
-async function poll(){{
-  try{{
-    const r=await fetch('/api/activation/'+ACT_ID);const d=await r.json();
-    renderActivation(d);
-  }}catch(e){{}}
-}}
-startIfNeeded();
-window.__timer=setInterval(poll,4000);poll();
-</script>"""
-    return page("Kích hoạt Gold — Locket Gold", body)
-
-
 def verify_page():
     body = f"""{nav_bar()}
 <section class="section"><div class="container">
-<div class="card verify-box" style="margin-top:40px">
-<div class="section-tag">Xác minh</div>
-<h2 style="font-size:28px">Kiểm tra <span class="gold-text">CDK</span></h2>
-<p class="lead" style="margin:8px auto 0">Nhập mã CDK đã mua để xem trạng thái — hợp lệ, đã dùng hay không tồn tại.</p>
-<input class="verify-input" id="verify-code" placeholder="LOCK-XXXXXXXX-XXXX-XXXX" autocomplete="off" spellcheck="false">
-<button class="btn btn-gold" onclick="verify()" style="justify-content:center">🔍 Kiểm tra ngay</button>
+<div class="card redeem-box" style="text-align:center">
+<div class="section-tag">Kiểm tra key</div>
+<h2 style="font-size:26px;margin-top:8px">Xác minh <span class="gold-text">key</span></h2>
+<p class="lead" style="margin:8px auto 0">Dán key để xem trạng thái, gói và số lượt còn lại.</p>
+<input class="verify-input" id="verify-code" placeholder="LK-GOLD-XXXXXX" autocomplete="off" spellcheck="false">
+<button class="btn btn-gold" onclick="verify()" style="justify-content:center">🔍 Kiểm tra</button>
 <div id="verify-result"></div>
+
+<div style="margin-top:34px;border-top:1px dashed var(--line);padding-top:26px">
+  <div class="section-tag">Kích hoạt luôn</div>
+  <h3 style="margin:10px 0 0;font-size:19px">Kích hoạt Gold bằng key</h3>
+  <div class="redeem-row">
+    <input id="rw-code" placeholder="Key của bạn" autocomplete="off" spellcheck="false">
+    <input id="rw-username" placeholder="Username hoặc link locket.cam/..." autocomplete="off" spellcheck="false">
+    <button class="btn btn-gold" id="rw-btn" onclick="redeemKey()">🚀 Kích hoạt</button>
+  </div>
+  <div id="rw-result" style="margin-top:14px"></div>
+</div>
 </div></div></section>
-<footer><div class="container">© 2026 Locket Gold — Kiểm tra CDK</div></footer>
+<footer><div class="container">© 2026 Locket Gold — Kiểm tra &amp; kích hoạt key.</div></footer>
+
 <script>
+function esc(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}}
 async function verify(){{
   const code=document.getElementById('verify-code').value.trim();
   const box=document.getElementById('verify-result');
@@ -1072,167 +836,246 @@ async function verify(){{
   try{{
     const r=await fetch('/api/verify',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{code:code}})}});
     const d=await r.json();
-    if(d.status==='valid')box.innerHTML='<div class="result-card ok"><div class="big">✅ CDK hợp lệ</div><div>Mã <b>'+d.code+'</b> còn sử dụng được. Nhập vào bot để kích hoạt Gold.</div><div class="meta" style="margin-top:6px">Mã cấp: '+d.created_at+' · Loại: '+d.source+'</div></div>';
-    else if(d.status==='used')box.innerHTML='<div class="result-card bad"><div class="big">❌ CDK đã được sử dụng</div><div class="meta">Đã kích hoạt lúc: '+d.used_at+(d.used_by?' · Bởi user #'+d.used_by:'')+'</div></div>';
-    else if(d.status==='reserved')box.innerHTML='<div class="result-card info"><div class="big">⏳ CDK đang được giữ</div><div class="meta">Đơn hàng đang xử lý. Thử lại sau ít phút.</div></div>';
-    else box.innerHTML='<div class="result-card bad"><div class="big">⚠️ Không tìm thấy CDK</div><div class="meta">Mã không tồn tại hoặc sai định dạng.</div></div>';
-  }}catch(e){{box.innerHTML='<div class="result-card bad"><div class="big">⚠️ Lỗi kiểm tra</div><div class="meta">'+e.message+'</div></div>';}}
+    const planName=d.plan==='1y'?'1 Năm':'1 Tháng';
+    if(d.status==='valid'){{box.innerHTML='<div class="result-card ok"><div class="big">✅ Key hợp lệ</div><div>Mã <b>'+esc(d.code)+'</b> — gói <b>'+planName+'</b>, còn <b>'+d.spins_left+'/'+d.spins+'</b> lượt.</div></div>';document.getElementById('rw-code').value=d.code||code;}}
+    else if(d.status==='used')box.innerHTML='<div class="result-card bad"><div class="big">❌ Key đã dùng hết lượt</div><div class="meta">Dùng lần cuối: '+esc(d.used_at||'—')+'</div></div>';
+    else if(d.status==='reserved')box.innerHTML='<div class="result-card info"><div class="big">⏳ Key đang được giữ</div><div class="meta">Thử lại sau ít phút.</div></div>';
+    else box.innerHTML='<div class="result-card bad"><div class="big">⚠️ Không tìm thấy key</div><div class="meta">Mã không tồn tại hoặc sai định dạng.</div></div>';
+  }}catch(e){{box.innerHTML='<div class="result-card bad"><div class="big">⚠️ Lỗi kiểm tra</div><div class="meta">'+esc(e.message)+'</div></div>';}}
+}}
+async function redeemKey(){{
+  const code=document.getElementById('rw-code').value.trim();
+  const username=document.getElementById('rw-username').value.trim();
+  const btn=document.getElementById('rw-btn');
+  const box=document.getElementById('rw-result');
+  if(!code||!username){{alert('Nhập key và username Locket');return;}}
+  btn.disabled=true;btn.textContent='⏳ Đang kích hoạt...';
+  box.innerHTML='<div class="result-card info"><div class="big">⏳ Đang kích hoạt Gold...</div></div>';
+  try{{
+    const r=await fetch('/api/redeem',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{code:code,username:username}})}});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw new Error(d.error||'Lỗi hệ thống');
+    box.innerHTML='<div class="result-card ok"><div class="big">🎉 KÍCH HOẠT THÀNH CÔNG</div><div>User: <b>'+esc(d.username)+'</b><br>Hạn Gold: <b>'+esc(d.expires||'—')+'</b>'+(d.days_left?' (còn '+d.days_left+' ngày)':'')+'<br>Key còn <b>'+d.spins_left+'</b> lượt.</div></div>';
+  }}catch(e){{box.innerHTML='<div class="result-card bad"><div class="big">❌ Thất bại</div><div class="meta">'+esc(e.message)+'</div></div>';}}
+  btn.disabled=false;btn.textContent='🚀 Kích hoạt';
 }}
 </script>"""
-    return page("Kiểm tra CDK — Locket Gold", body)
+    return page("Kiểm tra & kích hoạt key — Locket Gold", body)
 
 
 # ---------------------------------------------------------------------------
-# Admin templates
+# Admin pages
 # ---------------------------------------------------------------------------
 
 ADMIN_SHELL = """<nav class="nav"><div class="container nav-inner">
 <a class="logo" href="/"><span class="mark">👑</span>Locket <span class="gold-text">Gold</span></a>
-<div class="nav-links"><a href="/">← Về trang chủ</a><a href="/admin/logout">Đăng xuất</a></div></div></nav>
-<div class="admin-layout"><div class="admin-side">
-<a href="/admin" class="{a_dash}">📊 Tổng quan</a>
-<a href="/admin/orders" class="{a_orders}">🧾 Đơn hàng</a>
-<a href="/admin/cdks" class="{a_cdks}">🎟️ CDK</a>
-</div><div class="admin-main">"""
+<div class="nav-links"><a href="/admin/logout">Đăng xuất</a></div></div></nav>"""
 
 
 def admin_page(title, body, active=""):
-    shell = ADMIN_SHELL.format(
-        a_dash="active" if active == "dash" else "",
-        a_orders="active" if active == "orders" else "",
-        a_cdks="active" if active == "cdks" else "",
+    links = [
+        ("/admin", "Tổng quan", "dash"),
+        ("/admin/orders", "Đơn hàng", "orders"),
+        ("/admin/keys", "Kho key", "keys"),
+        ("/admin/sources", "Nguồn Gold", "sources"),
+    ]
+    side = "".join(
+        f'<a href="{href}" {"class=\'active\'" if active==key else ""}>{label}</a>'
+        for href, label, key in links
     )
-    return page(f"{title} — Admin", shell + body + "</div></div>")
+    return page(title, f"""{ADMIN_SHELL}
+<div class="admin-layout">
+<div class="admin-side">{side}</div>
+<div class="admin-main">{body}</div>
+</div>""")
 
 
 def login_page(error=None, csrf=""):
     error_html = f'<div class="auth-error">{html.escape(error)}</div>' if error else ""
-    csrf_field = f'<input type="hidden" name="csrf" value="{html.escape(csrf)}">' if csrf else ""
-    body = f"""{nav_bar()}
+    return page("Đăng nhập quản trị — Locket Gold", f"""{ADMIN_SHELL}
 <div class="card auth-card">
-<div class="logo"><span class="mark">🔐</span>Admin <span class="gold-text">Panel</span></div>
-<p style="color:var(--muted);font-size:14px;margin-top:6px">Đăng nhập để quản lý cửa hàng</p>
+<div class="logo"><span class="mark">👑</span>Quản trị</div>
 {error_html}
 <form method="post" action="/admin/login">
-{csrf_field}
+<input type="hidden" name="csrf" value="{html.escape(csrf)}">
 <div class="field"><label>Tên đăng nhập</label><input name="username" autocomplete="username" required></div>
 <div class="field"><label>Mật khẩu</label><input type="password" name="password" autocomplete="current-password" required></div>
-<button class="btn btn-gold" style="justify-content:center">Đăng nhập</button>
-</form></div>"""
-    return page("Admin Login — Locket Gold", body)
+<button class="btn btn-gold" type="submit" style="justify-content:center">🔐 Đăng nhập</button>
+</form></div>""")
 
 
 def _status_tag(status):
-    known = {"pending", "completed", "expired", "canceled", "queued", "processing", "success", "failed", "awaiting_payment", "paid"}
-    cls = status if status in known else "pending"
-    labels = {
-        "pending": "Chờ thanh toán", "completed": "Hoàn tất", "expired": "Hết hạn", "canceled": "Đã hủy",
-        "awaiting_payment": "Chờ thanh toán", "paid": "Đã thanh toán", "queued": "Trong hàng đợi", "processing": "Đang kích hoạt",
-        "success": "Thành công", "failed": "Thất bại",
-    }
-    return f'<span class="tag {cls}">{labels.get(status, status)}</span>'
+    return f'<span class="tag {html.escape(status)}">{html.escape(status)}</span>'
 
 
 def admin_dashboard():
-    o = db.cdk_order_stats()
-    c = db.cdk_stats()
-    s = db.get_stats()
-    w = db.web_activation_stats()
-    orders = db.list_cdk_orders(limit=8)
+    order_stats = db.cdk_order_stats()
+    key_stats = db.cdk_stats()
+    source_stats = db.gold_source_stats()
+    recent = db.list_cdk_orders(limit=8)
     rows = "".join(
-        f"<tr><td>#{r['id']}</td><td>{r['quantity']}</td>"
-        f"<td>{format_vnd(r['total_price'])}</td>"
-        f"<td>{_status_tag(r['status'])}</td>"
-        f"<td>{_fmt_dt(r['created_at'])}</td>"
-        f"<td>{_fmt_dt(r['completed_at'])}</td></tr>"
-        for r in orders
+        f"<tr><td>#{row['id']}</td><td>{row['user_id']}</td>"
+        f"<td>{plan_label(row.get('plan'), 'VI')}</td><td>{row['quantity']}</td>"
+        f"<td>{format_vnd(row['total_price'] or 0)}</td><td>{_status_tag(row['status'])}</td>"
+        f"<td>{_fmt_dt(row['created_at'])}</td></tr>"
+        for row in recent
     )
-    acts = db.list_web_activations(limit=6)
-    act_rows = "".join(
-        f"<tr><td>#{a['id']}</td><td class='mono'>{html.escape(a['username'] or '—')}</td>"
-        f"<td class='mono'>{html.escape(str(a['uid'] or '—'))}</td>"
-        f"<td>{_status_tag('completed' if a['status'] == 'success' else a['status'])}</td>"
-        f"<td>{_fmt_dt(a['created_at'])}</td></tr>"
-        for a in acts
-    )
-    body = f"""<h1>Tổng quan</h1><div class="sub">Cửa hàng Locket Gold — {time.strftime('%d/%m/%Y %H:%M')}</div>
+    body = f"""
+<h1>Tổng quan</h1>
+<div class="sub">Doanh thu, key và kho nguồn Gold dùng chung với bot.</div>
 <div class="stats">
-<div class="stat"><div class="v gold-text">{format_vnd(o['revenue'])}</div><div class="k">Doanh thu</div></div>
-<div class="stat"><div class="v">{o['completed']}</div><div class="k">Đơn hoàn tất</div></div>
-<div class="stat"><div class="v">{o['pending']}</div><div class="k">Đơn chờ</div></div>
-<div class="stat"><div class="v">{w['success']}</div><div class="k">Kích hoạt web OK</div></div>
-<div class="stat"><div class="v">{w['failed']}</div><div class="k">Kích hoạt web lỗi</div></div>
-<div class="stat"><div class="v">{c['unused']}</div><div class="k">CDK còn lại</div></div>
-<div class="stat"><div class="v">{c['used']}/{c['total']}</div><div class="k">CDK đã dùng</div></div>
-<div class="stat"><div class="v">{s['unique_users']}</div><div class="k">User Telegram</div></div>
+  <div class="stat"><div class="v gold-text">{format_vnd(order_stats['revenue'])}</div><div class="k">Doanh thu</div></div>
+  <div class="stat"><div class="v">{order_stats['completed']}</div><div class="k">Đơn hoàn tất</div></div>
+  <div class="stat"><div class="v">{order_stats['pending']}</div><div class="k">Đơn chờ</div></div>
+  <div class="stat"><div class="v">{key_stats['unused']}/{key_stats['total']}</div><div class="k">Key chưa dùng</div></div>
+  <div class="stat"><div class="v">{source_stats['usable']}/{source_stats['total']}</div><div class="k">Nguồn khả dụng</div></div>
 </div>
-<h2 style="font-size:17px;margin-bottom:12px">Kích hoạt web gần đây</h2>
-<div class="card" style="padding:6px;overflow-x:auto;margin-bottom:22px">
-<table class="table"><tr><th>ID</th><th>Username</th><th>UID</th><th>Trạng thái</th><th>Tạo lúc</th></tr>{act_rows}</table>
-</div>
-<h2 style="font-size:17px;margin-bottom:12px">Đơn gần đây</h2>
-<div class="card" style="padding:6px;overflow-x:auto">
-<table class="table"><tr><th>ID</th><th>SL</th><th>Tiền</th><th>Trạng thái</th><th>Tạo lúc</th><th>Hoàn tất</th></tr>{rows}</table>
-</div>"""
-    return admin_page("Tổng quan", body, "dash")
+<h1 style="font-size:19px">Đơn gần đây</h1>
+<div class="sub"></div>
+<div class="card" style="padding:10px 14px"><table class="table">
+<tr><th>ID</th><th>User</th><th>Gói</th><th>SL</th><th>Tiền</th><th>Trạng thái</th><th>Tạo lúc</th></tr>
+{rows or '<tr><td colspan="7">Chưa có đơn nào.</td></tr>'}
+</table></div>"""
+    return admin_page("Tổng quan — Admin", body, active="dash")
 
 
 def admin_orders():
-    orders = db.list_cdk_orders(limit=100)
+    orders = db.list_cdk_orders(limit=200)
     rows = "".join(
-        f"<tr><td>#{r['id']}</td><td class='mono'>{html.escape(str(r['payment_content'] or '—'))}</td>"
-        f"<td>{r['quantity']}</td><td>{format_vnd(r['total_price'])}</td>"
-        f"<td>{_status_tag(r['status'])}</td><td>{_fmt_dt(r['created_at'])}</td>"
-        f"<td>{_fmt_dt(r['completed_at'])}</td><td class='mono'>{html.escape(str(r['transaction_id'] or '—'))}</td></tr>"
-        for r in orders
+        f"<tr><td>#{row['id']}</td><td>{row['user_id']}</td>"
+        f"<td>{plan_label(row.get('plan'), 'VI')}</td><td>{row['quantity']}</td>"
+        f"<td>{format_vnd(row['total_price'] or 0)}</td><td>{_status_tag(row['status'])}</td>"
+        f"<td class='mono'>{html.escape(str(row['payment_content'] or ''))}</td>"
+        f"<td>{_fmt_dt(row['created_at'])}</td><td>{_fmt_dt(row['completed_at'])}</td></tr>"
+        for row in orders
     )
-    body = f"""<h1>Đơn hàng</h1><div class="sub">100 đơn mới nhất (bao gồm cả đơn từ bot Telegram)</div>
-<div class="card" style="padding:6px;overflow-x:auto">
-<table class="table"><tr><th>ID</th><th>Nội dung CK</th><th>SL</th><th>Tiền</th><th>Trạng thái</th><th>Tạo lúc</th><th>Hoàn tất</th><th>Giao dịch</th></tr>{rows}</table>
-</div>"""
-    return admin_page("Đơn hàng", body, "orders")
+    body = f"""
+<h1>Đơn hàng</h1>
+<div class="sub">Toàn bộ đơn mua key từ web và bot.</div>
+<div class="card" style="padding:10px 14px"><table class="table">
+<tr><th>ID</th><th>User</th><th>Gói</th><th>SL</th><th>Tiền</th><th>Trạng thái</th><th>Nội dung</th><th>Tạo</th><th>Hoàn tất</th></tr>
+{rows or '<tr><td colspan="9">Chưa có đơn nào.</td></tr>'}
+</table></div>"""
+    return admin_page("Đơn hàng — Admin", body, active="orders")
 
 
-def admin_cdks(csrf=""):
-    codes = db.list_cdk_codes(limit=100, secret=CDK_SECRET)
+def admin_keys(csrf=""):
+    keys = db.list_cdk_codes(limit=200, secret=CDK_SECRET)
     rows = "".join(
-        f"<tr><td class='mono'>{html.escape(str(r.get('code') or '—'))}</td>"
-        f"<td>{'<span class=\'tag valid\'>Chưa dùng</span>' if not r['used'] else '<span class=\'tag used\'>Đã dùng</span>'}</td>"
-        f"<td>{r['source'] or 'admin'}</td><td>{r['used_by'] if r['used_by'] is not None else '—'}</td>"
-        f"<td>{_fmt_dt(r['created_at'] if r.get('created_at') else None)}</td>"
-        f"<td>{html.escape(str(r['used_at'] or '—'))}</td>"
-        f"<td>{('#' + str(r['order_id'])) if r['order_id'] else '—'}</td></tr>"
-        for r in codes
+        f"<tr><td class='mono'>{html.escape(row.get('code') or row['code_hash'][:16])}</td>"
+        f"<td>{plan_label(row.get('plan'), 'VI')}</td>"
+        f"<td>{row.get('spins_left', 0)}/{row.get('spins', 1)}</td>"
+        f"<td>{_status_tag('valid' if (row.get('spins_left') or 0) > 0 else 'used')}</td>"
+        f"<td>{row['used_by'] if row['used_by'] is not None else '—'}</td>"
+        f"<td>{html.escape(str(row.get('source') or 'admin'))}</td>"
+        f"<td>{_fmt_dt(row.get('created_ts'))}</td></tr>"
+        for row in keys
     )
-    body = f"""<h1>CDK</h1><div class="sub">Tạo mã mới hoặc xem 100 mã gần nhất (đã giải mã)</div>
-<form class="admin-form" id="gen-form">
-<div class="field"><label>Số lượng CDK (1–500)</label>
-<input type="number" name="count" min="1" max="500" value="10" required></div>
-<button class="btn btn-gold" type="submit">🎟️ Tạo CDK</button>
-</form>
-<div class="gen-result" id="gen-result"></div>
-<div class="card" style="padding:6px;overflow-x:auto">
-<table class="table"><tr><th>Mã CDK</th><th>Trạng thái</th><th>Nguồn</th><th>Dùng bởi</th><th>Tạo lúc</th><th>Dùng lúc</th><th>Đơn</th></tr>{rows}</table>
+    body = f"""
+<h1>Kho key</h1>
+<div class="sub">Tạo key thủ công (dùng được trên web và bot).</div>
+<div class="admin-form">
+  <div class="field"><label>Số lượng key</label><input id="gen-count" type="number" min="1" max="500" value="1"></div>
+  <div class="field"><label>Số lượt / key</label><input id="gen-spins" type="number" min="1" max="500" value="1"></div>
+  <div class="field"><label>Gói</label><select id="gen-plan"><option value="1m">1 Tháng</option><option value="1y">1 Năm</option></select></div>
+  <button class="btn btn-gold" id="gen-btn" onclick="genKeys()">🎟️ Tạo key</button>
 </div>
+<div class="gen-result" id="gen-result"></div>
+<div class="card" style="padding:10px 14px"><table class="table">
+<tr><th>Mã</th><th>Gói</th><th>Lượt</th><th>Trạng thái</th><th>Dùng bởi</th><th>Nguồn</th><th>Tạo lúc</th></tr>
+{rows or '<tr><td colspan="7">Chưa có key nào.</td></tr>'}
+</table></div>
 <script>
-const CSRF_TOKEN='{csrf}';
-document.getElementById('gen-form').addEventListener('submit',async function(e){{
-  e.preventDefault();
-  const count=this.elements['count'].value;
-  const r=await fetch('/admin/cdks/generate',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF_TOKEN}},body:JSON.stringify({{count:parseInt(count)}})}});
-  const d=await r.json();
-  const box=document.getElementById('gen-result');
-  if(!r.ok||!d.ok){{box.style.display='block';box.style.borderColor='rgba(255,107,107,.4)';box.textContent='⚠️ '+(d.error||'Lỗi');return;}}
-  box.style.display='block';box.style.borderColor='rgba(61,220,151,.3)';
-  box.innerHTML='✅ Đã tạo '+d.codes.length+' CDK:<br>'+d.codes.join('\\n');
-  setTimeout(function(){{location.reload();}},2500);
-}});
+const CSRF={json.dumps(csrf)};
+function esc(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+async function genKeys(){{
+  const count=parseInt(document.getElementById('gen-count').value||'1',10);
+  const spins=parseInt(document.getElementById('gen-spins').value||'1',10);
+  const plan=document.getElementById('gen-plan').value;
+  const btn=document.getElementById('gen-btn'),box=document.getElementById('gen-result');
+  btn.disabled=true;btn.textContent='⏳ Đang tạo...';
+  try{{
+    const r=await fetch('/admin/keys/generate',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:JSON.stringify({{count:count,spins:spins,plan:plan}})}});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw new Error(d.error||'Lỗi hệ thống');
+    box.style.display='block';box.textContent=d.codes.join('\\n');
+  }}catch(e){{box.style.display='block';box.textContent='❌ '+e.message;}}
+  btn.disabled=false;btn.textContent='🎟️ Tạo key';
+}}
 </script>"""
-    return admin_page("CDK", body, "cdks")
+    return admin_page("Kho key — Admin", body, active="keys")
+
+
+def admin_sources(csrf=""):
+    sources = db.list_gold_sources()
+    rows = "".join(
+        f"<tr><td class='mono'>{html.escape(row['username'])}</td>"
+        f"<td>{row['count']}/5</td>"
+        f"<td>{row['in_flight']}</td>"
+        f"<td>{row['slots_left']}</td>"
+        f"<td>{row['days_left']}</td>"
+        f"<td>{html.escape(str(row['expires_at'] or '—'))}</td>"
+        f"<td><button class='btn-sm danger' onclick=\"removeSource('{html.escape(row['username'])}')\">Xóa</button></td></tr>"
+        for row in sources
+    )
+    body = f"""
+<h1>Nguồn Gold</h1>
+<div class="sub">Kho nguồn dùng chung với bot. Nguồn dưới 10 ngày hoặc chạm 5/5 lượt sẽ bị loại tự động.</div>
+<div class="admin-form">
+  <div class="field"><label>Thêm nguồn (username hoặc link Locket)</label><input id="src-name" placeholder="https://locket.cam/username"></div>
+  <button class="btn btn-gold" id="src-btn" onclick="addSource()">➕ Kiểm tra &amp; thêm</button>
+  <button class="btn btn-ghost" id="clean-btn" onclick="cleanSources()">🧹 Dọn nguồn hết hạn</button>
+</div>
+<div class="gen-result" id="src-result"></div>
+<div class="card" style="padding:10px 14px"><table class="table">
+<tr><th>Username</th><th>Đã dùng</th><th>Đang xử lý</th><th>Còn slot</th><th>Còn ngày</th><th>Hết hạn</th><th></th></tr>
+{rows or '<tr><td colspan="7">Kho nguồn đang trống.</td></tr>'}
+</table></div>
+<script>
+const CSRF={json.dumps(csrf)};
+function esc(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+function show(msg){{const box=document.getElementById('src-result');box.style.display='block';box.textContent=msg;}}
+async function addSource(){{
+  const name=document.getElementById('src-name').value.trim();
+  const btn=document.getElementById('src-btn');
+  if(!name)return;
+  btn.disabled=true;btn.textContent='⏳ Đang kiểm tra...';
+  try{{
+    const r=await fetch('/admin/sources/add',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:JSON.stringify({{username:name}})}});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw new Error(d.error||'Lỗi hệ thống');
+    show('✅ Đã thêm @'+d.username+' — Gold còn '+d.days_left+' ngày (hạn '+d.expires+')');
+    setTimeout(function(){{location.reload();}},1200);
+  }}catch(e){{show('❌ '+e.message);}}
+  btn.disabled=false;btn.textContent='➕ Kiểm tra & thêm';
+}}
+async function removeSource(name){{
+  if(!confirm('Xóa nguồn @'+name+' khỏi kho?'))return;
+  try{{
+    const r=await fetch('/admin/sources/remove',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:JSON.stringify({{username:name}})}});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw new Error(d.error||'Lỗi hệ thống');
+    location.reload();
+  }}catch(e){{show('❌ '+e.message);}}
+}}
+async function cleanSources(){{
+  const btn=document.getElementById('clean-btn');
+  btn.disabled=true;btn.textContent='⏳ Đang dọn...';
+  try{{
+    const r=await fetch('/admin/sources/cleanup',{{method:'POST',headers:{{'X-CSRF-Token':CSRF}}}});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw new Error(d.error||'Lỗi hệ thống');
+    show('🧹 Đã dọn '+d.removed+' nguồn không còn dùng được.');
+    setTimeout(function(){{location.reload();}},1200);
+  }}catch(e){{show('❌ '+e.message);}}
+  btn.disabled=false;btn.textContent='🧹 Dọn nguồn hết hạn';
+}}
+</script>"""
+    return admin_page("Nguồn Gold — Admin", body, active="sources")
 
 
 # ---------------------------------------------------------------------------
-# Handlers
+# Handlers: storefront
 # ---------------------------------------------------------------------------
 
 async def index(request):
@@ -1244,37 +1087,38 @@ async def verify_page_handler(request):
 
 
 async def api_create_order(request):
-    if payment_config_errors() or CDK_UNIT_PRICE <= 0:
-        return web.json_response({"ok": False, "error": "Cửa hàng tạm đóng. Liên hệ admin."}, status=503)
     try:
         data = await request.json()
-        quantity = int(data.get("quantity", 0))
-    except (ValueError, TypeError, json.JSONDecodeError):
-        return web.json_response({"ok": False, "error": "Số lượng không hợp lệ."}, status=400)
-    if not 1 <= quantity <= MAX_QUANTITY:
-        return web.json_response({"ok": False, "error": f"Chọn số lượng từ 1-{MAX_QUANTITY}."}, status=400)
+    except json.JSONDecodeError:
+        return web.json_response({"ok": False, "error": "Yêu cầu không hợp lệ."}, status=400)
+    if payment_config_errors():
+        return web.json_response({"ok": False, "error": "Cửa hàng tạm đóng. Liên hệ admin."}, status=503)
+
+    plan = str(data.get("plan", "1m")).lower()
+    if plan not in ("1m", "1y"):
+        return web.json_response({"ok": False, "error": "Gói không hợp lệ."}, status=400)
+    try:
+        quantity = int(data.get("quantity", 1))
+    except (TypeError, ValueError):
+        quantity = 1
+    if quantity not in range(1, MAX_QUANTITY + 1):
+        return web.json_response({"ok": False, "error": f"Số lượng 1-{MAX_QUANTITY}."}, status=400)
+
+    price = _price_for_plan(plan)
+    if price <= 0:
+        return web.json_response({"ok": False, "error": "Gói này chưa được cấu hình giá."}, status=503)
 
     visitor = _visitor_id(request)
-    total = CDK_UNIT_PRICE * quantity
-    content = _gen_payment_content()
-    expires_at = _now_ts() + CDK_ORDER_TIMEOUT_MINUTES * 60
-    try:
-        order = db.create_cdk_order(
-            user_id=visitor,
-            chat_id=None,
-            quantity=quantity,
-            total_price=total,
-            payment_content=content,
-            expires_at=expires_at,
-        )
-    except Exception as exc:
-        logger.error("Create web order failed: %s", exc)
-        return web.json_response({"ok": False, "error": "Không tạo được đơn. Thử lại sau."}, status=500)
-
-    # Trigger an immediate (idempotent) payment check so a previously paid
-    # order that the poller has not seen yet is completed instantly.
+    order = db.create_cdk_order(
+        user_id=visitor,
+        chat_id=None,
+        quantity=quantity,
+        total_price=price * quantity,
+        payment_content=_gen_payment_content(),
+        expires_at=_now_ts() + CDK_ORDER_TIMEOUT_MINUTES * 60,
+        plan=plan,
+    )
     asyncio.create_task(_complete_web_order(order["id"]))
-
     response = web.json_response({"ok": True, "order_id": order["id"]})
     response.set_cookie(VISITOR_COOKIE, str(visitor), max_age=365 * 24 * 3600, httponly=True, samesite="lax")
     return response
@@ -1299,68 +1143,48 @@ async def api_order_status(request):
     order = db.get_cdk_order(id=order_id)
     if not order:
         return web.json_response({"status": "not_found"})
-    status = order["status"]
-    payload = {"status": status, "id": order["id"], "quantity": order["quantity"]}
-    activation = db.get_web_activation(order_id=order_id)
-    if activation:
-        payload["activation"] = {
-            "id": activation["id"],
-            "status": activation["status"],
-            "progress": activation["progress"],
-            "result": activation["result"],
-            "dns_link": activation["dns_link"],
-            "username": activation["username"],
-            "uid": activation["uid"],
-            "avatar": activation["avatar"],
-        }
-    if status == "pending":
-        if order["expires_at"] and order["expires_at"] <= _now_ts():
-            db.expire_cdk_orders()
-            return web.json_response({"status": "expired", "id": order["id"]})
-        # Idempotent on-demand check (rate-limited per order).
-        last = _payment_checks.get(order_id)
-        if last is None or _now_ts() - last >= SEPAY_POLL_INTERVAL_SECONDS:
-            codes = await _complete_web_order(order_id)
-            if codes:
-                status = "completed"
-                payload["codes"] = codes
-    elif status == "completed":
-        codes = db.complete_cdk_order(order_id=order_id, secret=CDK_SECRET)
-        payload["codes"] = codes or []
-        activation = db.get_web_activation(order_id=order_id)
-        if activation:
-            payload["activation"] = {
-                "id": activation["id"],
-                "status": activation["status"],
-                "progress": activation["progress"],
-                "result": activation["result"],
-                "dns_link": activation["dns_link"],
-                "username": activation["username"],
-                "uid": activation["uid"],
-                "avatar": activation["avatar"],
-            }
-    payload["status"] = status
-    return web.json_response(payload)
+    codes = None
+    if order["status"] == "completed":
+        codes = db.complete_cdk_order(
+            order_id=order_id,
+            transaction_id=order["transaction_id"],
+            matched_amount=order["matched_amount"],
+            secret=CDK_SECRET,
+        ) or []
+    return web.json_response({
+        "status": order["status"],
+        "codes": codes,
+        "plan": order.get("plan") or "1m",
+        "quantity": order["quantity"],
+        "total_price": order["total_price"],
+        "expires_at": order["expires_at"],
+    })
 
 
 async def api_verify(request):
     try:
         data = await request.json()
-        code = str(data.get("code", "")).strip()
-    except (ValueError, TypeError, json.JSONDecodeError):
-        code = ""
+    except json.JSONDecodeError:
+        return web.json_response({"ok": False, "error": "Yêu cầu không hợp lệ."}, status=400)
+    code = str(data.get("code", "")).strip().upper()
     if not code:
-        return web.json_response({"status": "empty"})
+        return web.json_response({"ok": False, "error": "Nhập mã key."}, status=400)
     detail = db.get_cdk_detail(code, secret=CDK_SECRET)
+    detail["ok"] = True
     return web.json_response(detail)
 
 
 def _parse_locket_username(text):
-    """Accept a bare username or a full locket.cam link."""
-    text = text.strip()
-    if "locket.cam/" in text:
-        return text.split("locket.cam/")[-1].split("?")[0]
-    return text
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    if "links/" in raw.lower():
+        return raw
+    for marker in ("locket.camera/invites/", "locket.cam/invites/", "locket.camera/", "locket.cam/"):
+        if marker in raw:
+            raw = raw.split(marker, 1)[1]
+            break
+    return raw.split("?", 1)[0].strip().strip("/").lstrip("@")[:60]
 
 
 def _normalize_avatar(url):
@@ -1368,13 +1192,10 @@ def _normalize_avatar(url):
         return None
     if url.startswith("//"):
         return "https:" + url
-    if url.startswith("/"):
-        return "https://locket.cam" + url
     return url
 
 
 async def api_check(request):
-    """Resolve username/link → uid, avatar, Gold status, paid-once flag."""
     try:
         data = await request.json()
     except json.JSONDecodeError:
@@ -1388,170 +1209,155 @@ async def api_check(request):
     uid = profile["uid"]
     status = await locket.check_status(uid)
     gold_active = bool(status and status.get("active"))
-    activation = db.get_web_activation(uid=uid)
+    activation = db.get_uid_activation(uid)
     return web.json_response({
         "ok": True,
         "uid": uid,
         "username": username,
         "avatar": _normalize_avatar(profile.get("avatar")),
         "gold_active": gold_active,
-        "expires": (status or {}).get("expires"),
-        "paid": db.is_uid_paid(uid),
-        "activation": {
-            "id": activation["id"],
-            "status": activation["status"],
-            "cdk_code": activation["cdk_code"],
-            "dns_link": activation["dns_link"],
-            "result": activation["result"],
-        } if activation else None,
+        "expires": (status or {}).get("expires") if gold_active else None,
+        "can_reactivate": activation is not None,
+        "activations": (activation or {}).get("activations", 0),
     })
 
 
-async def api_activate(request):
-    """Start activation: free re-activation for paid UIDs, else a paid order."""
+async def api_reactivate(request):
+    """Free re-activation for UIDs this shop has activated before."""
     try:
         data = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"ok": False, "error": "Yêu cầu không hợp lệ."}, status=400)
-    uid = str(data.get("uid", "")).strip()
-    username = str(data.get("username", "")).strip() or uid
-    avatar = str(data.get("avatar", "")).strip() or None
+    username = _parse_locket_username(str(data.get("username", "")))
+    if not username:
+        return web.json_response({"ok": False, "error": "Nhập username hoặc link Locket."}, status=400)
+
+    uid = await locket.resolve_uid(username)
+    if uid == "IP_BLOCKED":
+        return web.json_response({"ok": False, "error": "Dịch vụ đang tạm chặn IP, thử lại sau."}, status=503)
     if not uid:
-        return web.json_response({"ok": False, "error": "Thiếu UID tài khoản."}, status=400)
+        return web.json_response({"ok": False, "error": "Không tìm thấy tài khoản Locket."}, status=404)
+
+    record = db.get_uid_activation(uid)
+    if not record:
+        return web.json_response({
+            "ok": False,
+            "error": "Tài khoản này chưa từng kích hoạt tại shop — vui lòng mua key để kích hoạt.",
+        }, status=403)
+
+    now = _now_ts()
+    cooldown = FREE_REACTIVATE_COOLDOWN_MINUTES * 60
+    last_at = int(record.get("last_at") or 0)
+    if cooldown and now - last_at < cooldown:
+        remaining = max(1, (cooldown - (now - last_at)) // 60)
+        return web.json_response({
+            "ok": False,
+            "error": f"Tài khoản vừa được kích hoạt. Vui lòng thử lại sau ~{remaining} phút.",
+        }, status=429)
 
     visitor = _visitor_id(request)
+    used_today = db.count_free_reactivations(visitor, now - 86400)
+    if used_today >= FREE_REACTIVATE_DAILY_MAX:
+        return web.json_response({
+            "ok": False,
+            "error": "Bạn đã dùng hết lượt kích hoạt lại miễn phí hôm nay. Vui lòng thử lại sau.",
+        }, status=429)
 
-    if db.is_uid_paid(uid):
-        # Already bought once — re-activation is free, no new order.
-        activation_id = db.create_web_activation(
-            None, visitor, uid, username, avatar=avatar, status="queued",
+    result = await activation.activate(username, plan="1m")
+    if not result["ok"]:
+        messages = {
+            "not_found": "Không tìm thấy tài khoản Locket đích.",
+            "already_gold": result.get("message") or "Tài khoản đã có Gold.",
+            "no_source": "Kho nguồn đang trống, vui lòng thử lại sau.",
+            "ip_blocked": "Dịch vụ đang tạm chặn IP, thử lại sau.",
+            "proxy_error": "Lỗi kết nối proxy.",
+        }
+        return web.json_response(
+            {"ok": False, "error": messages.get(result["code"], result.get("message") or "Kích hoạt lại thất bại.")},
+            status=400,
         )
-        response = web.json_response({"ok": True, "free": True, "activation_id": activation_id})
+
+    db.mark_uid_activated(uid)
+    db.log_key_redemption("FREE-REACTIVATE", visitor, username, uid, "1m", status="success",
+                          detail=f"source={result.get('source')}")
+    response = web.json_response({
+        "ok": True,
+        "uid": uid,
+        "username": username,
+        "plan": "1m",
+        "expires": result.get("expires"),
+        "days_left": result.get("days_left", 0),
+        "free": True,
+    })
+    response.set_cookie(VISITOR_COOKIE, str(visitor), max_age=365 * 24 * 3600, httponly=True, samesite="lax")
+    return response
+
+
+async def api_redeem(request):
+    """Redeem a key on the web: consume one spin and run the alias activation."""
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"ok": False, "error": "Yêu cầu không hợp lệ."}, status=400)
+    code = str(data.get("code", "")).strip().upper()
+    username = _parse_locket_username(str(data.get("username", "")))
+    if not code:
+        return web.json_response({"ok": False, "error": "Nhập key của bạn."}, status=400)
+    if not username:
+        return web.json_response({"ok": False, "error": "Nhập username hoặc link Locket."}, status=400)
+
+    visitor = _visitor_id(request)
+    ok, reason, plan, left, _source = db.consume_key(code, visitor, secret=CDK_SECRET)
+    if not ok:
+        message = "Key không tồn tại hoặc không hợp lệ!" if reason == "not_found" else "Key này đã hết lượt sử dụng!"
+        response = web.json_response({"ok": False, "error": message}, status=400)
+        return response
+
+    result = await activation.activate(username, plan=plan)
+    if not result["ok"]:
+        db.refund_key_spin(code, secret=CDK_SECRET)
+        messages = {
+            "not_found": "Không tìm thấy tài khoản Locket đích.",
+            "already_gold": result.get("message") or "Tài khoản đã có Gold.",
+            "no_source": "Kho nguồn đang trống. Lượt key đã được hoàn lại.",
+            "ip_blocked": "Dịch vụ đang tạm chặn IP. Lượt key đã được hoàn lại, vui lòng thử lại sau.",
+            "proxy_error": "Lỗi kết nối proxy. Lượt key đã được hoàn lại.",
+        }
+        message = messages.get(result["code"], result.get("message") or "Kích hoạt thất bại.")
+        response = web.json_response({"ok": False, "error": message, "refunded": True}, status=400)
         response.set_cookie(VISITOR_COOKIE, str(visitor), max_age=365 * 24 * 3600, httponly=True, samesite="lax")
         return response
 
-    if payment_config_errors() or CDK_UNIT_PRICE <= 0:
-        return web.json_response({"ok": False, "error": "Cửa hàng tạm đóng. Liên hệ admin."}, status=503)
-
-    order = db.create_cdk_order(
-        user_id=visitor,
-        chat_id=None,
-        quantity=1,
-        total_price=CDK_UNIT_PRICE,
-        payment_content=_gen_payment_content(),
-        expires_at=_now_ts() + CDK_ORDER_TIMEOUT_MINUTES * 60,
-    )
-    activation = db.get_web_activation(order_id=order["id"])
-    if activation:
-        activation_id = activation["id"]
-    else:
-        activation_id = db.create_web_activation(
-            order["id"], visitor, uid, username, avatar=avatar, status="awaiting_payment",
-        )
-
-    # Trigger an immediate (idempotent) payment check.
-    asyncio.create_task(_complete_web_order(order["id"]))
-
-    response = web.json_response({"ok": True, "free": False, "order_id": order["id"], "activation_id": activation_id})
-    response.set_cookie(VISITOR_COOKIE, str(visitor), max_age=365 * 24 * 3600, httponly=True, samesite="lax")
-    return response
-
-
-async def api_activate_cdk(request):
-    """Activate Gold using a user-supplied CDK instead of buying a new one."""
-    try:
-        data = await request.json()
-    except json.JSONDecodeError:
-        return web.json_response({"ok": False, "error": "Yêu cầu không hợp lệ."}, status=400)
-    uid = str(data.get("uid", "")).strip()
-    username = str(data.get("username", "")).strip() or uid
-    avatar = str(data.get("avatar", "")).strip() or None
-    code = str(data.get("code", "")).strip().upper()
-    if not uid:
-        return web.json_response({"ok": False, "error": "Thiếu UID tài khoản."}, status=400)
-    if not code:
-        return web.json_response({"ok": False, "error": "Nhập mã CDK của bạn."}, status=400)
-
-    visitor = _visitor_id(request)
-
-    if not db.reserve_cdk(code, visitor, secret=CDK_SECRET, ttl_seconds=CDK_RESERVATION_TTL_SECONDS):
-        return web.json_response({"ok": False, "error": "CDK không hợp lệ hoặc đã được sử dụng."}, status=400)
-
-    db.mark_uid_paid(uid)
-    activation_id = db.create_web_activation(
-        None, visitor, uid, username, avatar=avatar, status="queued",
-    )
-    db.update_web_activation(activation_id, cdk_code=code)
-
-    response = web.json_response({"ok": True, "free": True, "activation_id": activation_id})
-    response.set_cookie(VISITOR_COOKIE, str(visitor), max_age=365 * 24 * 3600, httponly=True, samesite="lax")
-    return response
-
-
-async def api_start_order_activation(request):
-    """Flip a paid web activation from 'paid' to 'queued' — starts the bot worker."""
-    try:
-        order_id = int(request.match_info["order_id"])
-    except ValueError:
-        return web.json_response({"ok": False, "error": "Đơn hàng không hợp lệ."}, status=400)
-    activation = db.get_web_activation(order_id=order_id)
-    if not activation:
-        return web.json_response({"ok": False, "error": "Không tìm thấy kích hoạt."}, status=404)
-    status = activation["status"]
-    if status in ("paid", "awaiting_payment", "queued", "processing"):
-        if status in ("paid", "awaiting_payment"):
-            db.update_web_activation(activation["id"], status="queued")
-        return web.json_response({"ok": True, "activation_id": activation["id"], "status": "queued"})
-    return web.json_response({"ok": True, "activation_id": activation["id"], "status": status})
-
-
-async def activation_page_handler(request):
-    try:
-        activation_id = int(request.match_info["activation_id"])
-    except ValueError:
-        raise web.HTTPNotFound()
-    activation = db.get_web_activation(id=activation_id)
-    if not activation:
-        raise web.HTTPNotFound()
-    return web.Response(text=activation_page(activation), content_type="text/html")
-
-
-async def api_activation_status(request):
-    try:
-        activation_id = int(request.match_info["activation_id"])
-    except ValueError:
-        return web.json_response({"status": "not_found"})
-    activation = db.get_web_activation(id=activation_id)
-    if not activation:
-        return web.json_response({"status": "not_found"})
-    return web.json_response({
-        "status": activation["status"],
-        "progress": activation["progress"],
-        "result": activation["result"],
-        "dns_link": activation["dns_link"],
-        "username": activation["username"],
-        "uid": activation["uid"],
-        "avatar": activation["avatar"],
-        "order_id": activation["order_id"],
+    db.save_activation(visitor, result["uid"], username)
+    db.mark_uid_activated(result["uid"])
+    db.log_key_redemption(code, visitor, username, result["uid"], plan, status="success",
+                          detail=f"source={result.get('source')}")
+    response = web.json_response({
+        "ok": True,
+        "uid": result["uid"],
+        "username": username,
+        "plan": plan,
+        "expires": result.get("expires"),
+        "days_left": result.get("days_left", 0),
+        "spins_left": left,
     })
+    response.set_cookie(VISITOR_COOKIE, str(visitor), max_age=365 * 24 * 3600, httponly=True, samesite="lax")
+    return response
 
+
+# ---------------------------------------------------------------------------
+# Handlers: admin
+# ---------------------------------------------------------------------------
 
 async def admin_login_page(request):
     if _is_admin(request):
         raise web.HTTPFound("/admin")
     nonce = secrets.token_hex(16)
     token = hmac.new(WEB_SESSION_SECRET.encode("utf-8"), nonce.encode("utf-8"), hashlib.sha256).hexdigest()
-    response = web.Response(
-        text=login_page(csrf=token),
-        content_type="text/html",
-    )
+    response = web.Response(text=login_page(csrf=token), content_type="text/html")
     response.set_cookie(
-        CSRF_COOKIE,
-        nonce,
-        max_age=SESSION_TTL_SECONDS,
-        httponly=True,
-        samesite="lax",
-        secure=_secure_cookie(request),
+        CSRF_COOKIE, nonce, max_age=SESSION_TTL_SECONDS, httponly=True,
+        samesite="lax", secure=_secure_cookie(request),
     )
     return response
 
@@ -1560,37 +1366,25 @@ async def admin_login(request):
     if _is_admin(request):
         raise web.HTTPFound("/admin")
     ip = _client_ip(request)
-    csrf = request.cookies.get(CSRF_COOKIE, "")
-    if not WEB_ADMIN_PASSWORD_HASH and not WEB_ADMIN_PASSWORD:
-        return web.Response(text=login_page("Tài khoản admin chưa được cấu hình.", csrf=csrf), content_type="text/html")
     if not _login_allowed(ip):
-        return web.Response(
-            text=login_page("Quá nhiều lần thử sai. Vui lòng đợi 15 phút.", csrf=csrf),
-            content_type="text/html",
-        )
-    data = await request.post()
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
-    posted_csrf = data.get("csrf", "")
-    if not _check_csrf(request, posted_csrf):
-        return web.Response(
-            text=login_page("Phiên đăng nhập không hợp lệ. Tải lại trang và thử lại.", csrf=csrf),
-            content_type="text/html",
-        )
-    if username == WEB_ADMIN_USER and _verify_admin_password(password):
-        _login_attempts.pop(ip, None)
-        response = web.HTTPFound("/admin")
-        response.set_cookie(
-            SESSION_COOKIE,
-            _make_session_token(username),
-            max_age=SESSION_TTL_SECONDS,
-            httponly=True,
-            samesite="lax",
-            secure=_secure_cookie(request),
-        )
-        return response
-    _record_login_fail(ip)
-    return web.Response(text=login_page("Sai tên đăng nhập hoặc mật khẩu.", csrf=csrf), content_type="text/html")
+        return web.Response(text=login_page("Quá nhiều lần thử. Vui lòng đợi 15 phút."), content_type="text/html", status=429)
+    try:
+        data = await request.post()
+    except Exception:
+        data = {}
+    if not _check_csrf(request, data.get("csrf", "")):
+        return web.Response(text=login_page("Phiên đăng nhập không hợp lệ. Tải lại trang và thử lại."), content_type="text/html", status=400)
+    username = str(data.get("username", "")).strip()
+    password = str(data.get("password", ""))
+    if username != WEB_ADMIN_USER or not _verify_admin_password(password):
+        _record_login_fail(ip)
+        return web.Response(text=login_page("Sai tên đăng nhập hoặc mật khẩu."), content_type="text/html", status=401)
+    response = web.HTTPFound("/admin")
+    response.set_cookie(
+        SESSION_COOKIE, _make_session_token(username), max_age=SESSION_TTL_SECONDS,
+        httponly=True, samesite="lax", secure=_secure_cookie(request),
+    )
+    return response
 
 
 async def admin_logout(request):
@@ -1610,32 +1404,100 @@ async def admin_orders_handler(request):
 
 
 @_require_admin
-async def admin_cdks_handler(request):
-    csrf = _csrf_token(request) or ""
-    return web.Response(text=admin_cdks(csrf=csrf), content_type="text/html")
+async def admin_keys_handler(request):
+    return web.Response(text=admin_keys(csrf=_csrf_token(request) or ""), content_type="text/html")
 
 
 @_require_admin
-async def admin_generate_cdk(request):
-    csrf = request.headers.get("X-CSRF-Token", "")
-    if not _check_csrf(request, csrf):
-        return web.json_response({"ok": False, "error": "Phiên không hợp lệ. Tải lại trang."}, status=403)
+async def admin_sources_handler(request):
+    return web.Response(text=admin_sources(csrf=_csrf_token(request) or ""), content_type="text/html")
+
+
+async def _json_body(request):
     try:
-        data = await request.json()
-        count = int(data.get("count", 0))
-    except (ValueError, TypeError, json.JSONDecodeError):
+        return await request.json()
+    except json.JSONDecodeError:
+        return {}
+
+
+@_require_admin
+async def admin_generate_keys(request):
+    if not _check_csrf(request, request.headers.get("X-CSRF-Token", "")):
+        return web.json_response({"ok": False, "error": "CSRF"}, status=403)
+    data = await _json_body(request)
+    try:
+        count = int(data.get("count", 1))
+        spins = int(data.get("spins", 1))
+    except (TypeError, ValueError):
         return web.json_response({"ok": False, "error": "Số lượng không hợp lệ."}, status=400)
-    if not 1 <= count <= 500:
-        return web.json_response({"ok": False, "error": "Số lượng từ 1-500."}, status=400)
-    try:
-        codes = db.gen_cdk(count, admin_id=ADMIN_ID or 0, cdk_secret=CDK_SECRET, source="admin")
-    except ValueError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+    plan = str(data.get("plan", "1m")).lower()
+    if plan not in ("1m", "1y"):
+        return web.json_response({"ok": False, "error": "Gói không hợp lệ."}, status=400)
+    if not (1 <= count <= 500 and 1 <= spins <= 500):
+        return web.json_response({"ok": False, "error": "Số lượng 1-500."}, status=400)
+    if len(CDK_SECRET) < 32:
+        return web.json_response({"ok": False, "error": "Chưa cấu hình CDK_SECRET hợp lệ."}, status=503)
+    codes = db.gen_cdk(count, ADMIN_ID, cdk_secret=CDK_SECRET, source="admin", plan=plan, spins=spins)
+    if not codes:
+        return web.json_response({"ok": False, "error": "Không tạo được key."}, status=500)
     return web.json_response({"ok": True, "codes": codes})
 
 
+@_require_admin
+async def admin_source_add(request):
+    if not _check_csrf(request, request.headers.get("X-CSRF-Token", "")):
+        return web.json_response({"ok": False, "error": "CSRF"}, status=403)
+    data = await _json_body(request)
+    username = str(data.get("username", "")).strip()
+    if not username:
+        return web.json_response({"ok": False, "error": "Nhập username hoặc link Locket."}, status=400)
+    outcome = await activation.check_source({"username": username, "uid": None, "count": 0}, probe=False)
+    if outcome.get("status") != "usable":
+        errors = {
+            "not_found": "Không tìm thấy tài khoản Locket.",
+            "no_gold": "Tài khoản chưa có Gold.",
+            "expiring": "Gold còn quá ít ngày (dưới 10 ngày).",
+            "ip_blocked": "Đang bị chặn IP, thử lại sau.",
+        }
+        return web.json_response({"ok": False, "error": errors.get(outcome.get("status"), "Nguồn không hợp lệ.")}, status=400)
+    expires = outcome.get("expires") or ""
+    days_left = outcome.get("days_left", 0)
+    expires_text = f"expires: {expires} (còn {days_left} ngày)" if expires else ""
+    added = db.add_gold_source(
+        username, uid=outcome.get("uid"), expires=expires_text, min_days=GOLD_MIN_SOURCE_DAYS,
+    )
+    if not added:
+        return web.json_response({"ok": False, "error": "Không thêm được nguồn."}, status=400)
+    normalized = db.normalize_source_username(username)
+    return web.json_response({
+        "ok": True,
+        "username": normalized,
+        "expires": expires,
+        "days_left": days_left,
+    })
+
+
+@_require_admin
+async def admin_source_remove(request):
+    if not _check_csrf(request, request.headers.get("X-CSRF-Token", "")):
+        return web.json_response({"ok": False, "error": "CSRF"}, status=403)
+    data = await _json_body(request)
+    username = str(data.get("username", "")).strip()
+    if not username or not db.remove_gold_source(username):
+        return web.json_response({"ok": False, "error": "Không tìm thấy nguồn."}, status=404)
+    return web.json_response({"ok": True})
+
+
+@_require_admin
+async def admin_source_cleanup(request):
+    if not _check_csrf(request, request.headers.get("X-CSRF-Token", "")):
+        return web.json_response({"ok": False, "error": "CSRF"}, status=403)
+    removed = db.cleanup_gold_sources(min_days=GOLD_MIN_SOURCE_DAYS)
+    return web.json_response({"ok": True, "removed": removed})
+
+
 # ---------------------------------------------------------------------------
-# App / entry
+# App factory
 # ---------------------------------------------------------------------------
 
 def build_app():
@@ -1643,44 +1505,50 @@ def build_app():
     app.router.add_get("/", index)
     app.router.add_get("/verify", verify_page_handler)
     app.router.add_post("/api/order", api_create_order)
-    app.router.add_post("/api/verify", api_verify)
-    app.router.add_post("/api/check", api_check)
-    app.router.add_post("/api/activate", api_activate)
-    app.router.add_post("/api/activate-cdk", api_activate_cdk)
     app.router.add_get("/order/{order_id}", order_page_handler)
     app.router.add_get("/api/order/{order_id}", api_order_status)
-    app.router.add_post("/api/order/{order_id}/start", api_start_order_activation)
-    app.router.add_get("/activate/{activation_id}", activation_page_handler)
-    app.router.add_get("/api/activation/{activation_id}", api_activation_status)
+    app.router.add_post("/api/verify", api_verify)
+    app.router.add_post("/api/check", api_check)
+    app.router.add_post("/api/redeem", api_redeem)
+    app.router.add_post("/api/reactivate", api_reactivate)
     app.router.add_get("/admin/login", admin_login_page)
     app.router.add_post("/admin/login", admin_login)
     app.router.add_get("/admin/logout", admin_logout)
     app.router.add_get("/admin", admin_dashboard_handler)
     app.router.add_get("/admin/orders", admin_orders_handler)
-    app.router.add_get("/admin/cdks", admin_cdks_handler)
-    app.router.add_post("/admin/cdks/generate", admin_generate_cdk)
-    app.router.add_static("/static/dns", os.path.join(BASE_DIR, "stepdns"))
-
-    async def _start_poller(_app):
-        asyncio.create_task(web_payment_poller())
-
-    app.on_startup.append(_start_poller)
+    app.router.add_get("/admin/keys", admin_keys_handler)
+    app.router.add_get("/admin/sources", admin_sources_handler)
+    app.router.add_post("/admin/keys/generate", admin_generate_keys)
+    app.router.add_post("/admin/cdks/generate", admin_generate_keys)
+    app.router.add_post("/admin/sources/add", admin_source_add)
+    app.router.add_post("/admin/sources/remove", admin_source_remove)
+    app.router.add_post("/admin/sources/cleanup", admin_source_cleanup)
     return app
 
 
 async def main():
     db.init_db()
+    imported = db.import_sources_from_file(
+        os.path.join(BASE_DIR, "current_source.txt"), min_days=GOLD_MIN_SOURCE_DAYS
+    )
+    if imported:
+        logger.info("Imported %s sources from current_source.txt", imported)
+
+    if not WEB_ADMIN_PASSWORD and not WEB_ADMIN_PASSWORD_HASH:
+        logger.warning("WEB_ADMIN_PASSWORD is empty — admin panel disabled.")
+
     app = build_app()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, WEB_HOST, WEB_PORT)
     await site.start()
     logger.info("Web store running at http://%s:%s", WEB_HOST, WEB_PORT)
-    if payment_config_errors():
-        logger.warning("Payment config incomplete — buying disabled: %s", ", ".join(payment_config_errors()))
-    if not WEB_ADMIN_PASSWORD:
-        logger.warning("WEB_ADMIN_PASSWORD is empty — admin panel disabled.")
-    await asyncio.Event().wait()
+
+    poller = asyncio.create_task(web_payment_poller())
+    try:
+        await asyncio.Event().wait()
+    finally:
+        poller.cancel()
 
 
 if __name__ == "__main__":

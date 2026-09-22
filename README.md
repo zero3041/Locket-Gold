@@ -1,210 +1,169 @@
-# 🚀 Locket Gold Activator Bot (Professional Edition)
+# 🚀 Locket Gold — Bot & Web Store
 
 <div align="center">
 
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
-[![Telegram](https://img.shields.io/badge/Telegram-Bot-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://core.telegram.org/bots)
-[![AsyncIO](https://img.shields.io/badge/Async-Powered-green?style=for-the-badge&logo=icloud&logoColor=white)](https://docs.python.org/3/library/asyncio.html)
-[![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Active-success?style=for-the-badge)]()
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telegram-Bot-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)
+![aiohttp](https://img.shields.io/badge/aiohttp-Web%20Store-green?style=for-the-badge)
+![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
 
-**The most advanced, high-performance Telegram Bot for automating Locket Gold activation.**  
-*Built with speed, security, and scalability in mind.*
-
-[Why Choose This Bot?](#-why-choose-locket-gold-activator-bot) • [Features](#-key-features) • [Installation](#-installation) • [Configuration](#-configuration)
+**Bán key Locket Gold qua Telegram + web store, kích hoạt bằng cơ chế RevenueCat Alias.**
 
 </div>
 
 ---
 
-## 💎 Why Choose Locket Gold Activator Bot?
+## ✨ Cơ chế hoạt động
 
-Unlike other basic scripts or tools, this bot is engineered as a **production-grade system**. It solves the common problems of slowness, API bans, and revocations.
+Hệ thống dùng **kho nguồn Gold** (source pool). Mỗi nguồn là một tài khoản
+Locket đang có Gold; khi kích hoạt, hệ thống alias subscriber của nguồn sang
+UID đích, chuyển Gold sang tài khoản khách. Mỗi nguồn dùng tối đa **5 lượt**
+(trần alias của RevenueCat là 50, giữ biên an toàn).
 
-| Feature | This Bot 🚀 | Standard Scripts ❌ |
-| :--- | :--- | :--- |
-| **Performance** | **Zero-Lag Async Core**. Handles thousands of users without freezing. | Single-threaded. Freezes while processing one user. |
-| **Reliability** | **Round-Robin Token Rotation**. Distributes load to prevent bans. | Uses 1 token until it dies or gets rate-limited. |
-| **Safety** | **Smart Anti-Revoke**. Auto-generates NextDNS profiles to block validation servers. | No protection. Gold disappears after a few hours/days. |
-| **User Experience** | **Real-time Queue Updates**. Users know their exact position (`#1`, `#2`...). | Silent failure. Users don't know if it's working. |
-| **Architecture** | **Worker Pool**. Scalable system (add 1 or 100 workers easily). | Simple loop. Cannot scale with demand. |
-
----
-
-## 🌟 Key Features
-
-### ⚡ **High-Performance Core**
-*   **Fully Asynchronous**: Powered by `aiohttp` and `asyncio` for non-blocking I/O. The bot remains responsive to commands even under heavy load.
-*   **Worker Pool System**: Configurable number of concurrent workers (`NUM_WORKERS`) to parallelize request processing.
-
-### 🛡️ **Advanced Security**
-*   **NextDNS Integration**: Automatically creates a unique DNS profile for each user that blocks `revenuecat.com`, ensuring the Gold subscription sticks.
-*   **Strict Cooldowns**: Enforces a 45-second cooldown per token usage to mimic human behavior and avoid detection.
-
-### 🤖 **Smart Automation**
-*   **Auto-Resolution**: Just paste a Locket username or link; the bot handles UID resolution automatically.
-*   **Queue Management**: FIFO (First-In-First-Out) queue system with live status updates to prevent API flooding.
-*   **Admin Dashboard**: Powerful `/stats` command to monitor queue size, active workers, and success rates in real-time.
+* **Key theo gói**: `1m` ưu tiên nguồn còn 25-30 ngày, `1y` ưu tiên nguồn còn 200-360 ngày.
+* **Key đa lượt**: admin có thể tạo key dùng nhiều lần.
+* **Hoàn lượt tự động**: kích hoạt lỗi (hết nguồn, chặn IP, alias limit, nick đã có Gold) → hoàn lại lượt key.
+* **Tự chăm kho nguồn**: nguồn hết hạn / dưới 10 ngày / chạm limit bị loại tự động.
+* **Không cần DNS**: cơ chế alias không cần chặn revenuecat.
 
 ---
 
-## 🛠️ Installation
+## 🎮 Lệnh bot
 
-### Prerequisites
-*   Python 3.9+
-*   Telegram Bot Token via [@BotFather](https://t.me/BotFather)
-*   NextDNS API Key via [NextDNS Developer](https://my.nextdns.io/account)
+### Người dùng
 
-### Automated Setup
-We provide a **one-click setup script** that handles virtual environments and dependencies.
+| Lệnh | Mô tả |
+| :--- | :--- |
+| `/start`, `/menu` | Menu chính + bàn phím nhanh |
+| `/nap` | Mua key **Gói Vĩnh Viễn** (VietQR qua SePay) |
+| `/sodu` | Key còn lại, lịch sử mua & kích hoạt |
+| `/redeem <key> <link_locket>` | **Kích hoạt Gold** (ví dụ: `/redeem LK-GOLD-89ABCX https://locket.cam/username`) |
+| `/check <user_hoặc_link>` | Kiểm tra Gold + ngày hết hạn |
+| `/chk` (kèm file `.txt`) | Kiểm tra hàng loạt, tự thêm tài khoản đủ điều kiện vào kho nguồn |
+| `/scan <link_tiktok>` | Quét toàn bộ bình luận TikTok lấy link Locket rồi tự kiểm tra |
+| `/setlang`, `/help` | Đổi ngôn ngữ, trợ giúp |
+
+### Admin
+
+| Lệnh | Mô tả |
+| :--- | :--- |
+| `/genkey <số_lượt> [1m\|1y]` | Tạo key thủ công (ví dụ `/genkey 5 1y`) |
+| `/set <link_nguồn>` | Xem kho nguồn hoặc thêm nguồn mới |
+| `/checksources [quick]` | Kiểm tra & dọn kho nguồn (mặc định thử alias để phát hiện trần limit; `quick` = chỉ check trạng thái) |
+| `/stats` | Thống kê hệ thống |
+| `/noti <msg>` | Thông báo tới toàn bộ user |
+| `/setdonate`, `/setvideo` | Ảnh thành công, video hướng dẫn |
+
+---
+
+## 🌐 Web Store
+
+`web_store.py` chạy song song với bot, dùng chung database:
+
+* **Trang bán** (`/`): gói **Vĩnh Viễn** duy nhất, kiểm tra tài khoản Locket,
+  tạo đơn VietQR, **kích hoạt key trực tiếp trên web**, và **kích hoạt lại
+  miễn phí** khi Gold rớt (cho tài khoản đã từng kích hoạt).
+* **Trang đơn** (`/order/<id>`): QR + trạng thái thanh toán + key giao tự động
+  + form kích hoạt ngay.
+* **Kiểm tra key** (`/verify`): trạng thái, gói và số lượt còn lại.
+* **Admin** (`/admin`): doanh thu, đơn hàng, tạo key, và **quản lý kho nguồn
+  Gold** (thêm/xóa/dọn nguồn) ngay trên web.
+
+---
+
+## 🛠️ Cài đặt
 
 ```bash
-# 1. Clone the repository
 git clone git@github.com:zero3041/Locket-Gold.git
 cd Locket-Gold
+cp .env.example .env      # điền các biến bên dưới
+./run.sh                  # tạo venv, cài deps, chạy web store + bot
+```
 
-# 2. Run the setup script
-chmod +x run.sh
-./run.sh
+Chạy nền (tắt terminal vẫn chạy):
+
+```bash
+nohup ./venv/bin/python3 -u web_store.py >> web_store.out 2>&1 &
+nohup ./venv/bin/python3 -u main.py >> bot.out 2>&1 &
 ```
 
 ---
 
-## ⚙️ Configuration
+## ⚙️ Cấu hình
 
-Sensitive payment/CDK settings are read from environment variables. The bot
-loads the local ignored `.env` file automatically, while process-level
-environment variables take precedence. Copy `.env.example` as a starting point;
-`/muacdk` stays fail-closed until every required payment value is valid.
+Cấu hình đọc từ `.env` (biến môi trường của process được ưu tiên).
 
-Required for CDK sales:
-
-| Variable | Meaning |
+| Biến | Ý nghĩa |
 | :--- | :--- |
-| `SEPAY_API_TOKEN` | SePay API v2 Bearer token |
-| `BANK_BIN`, `BANK_ACCOUNT` | VietQR receiving account |
-| `BANK_NAME`, `BANK_OWNER` | Payment instructions shown to users |
-| `CDK_UNIT_PRICE` | Price of one CDK in VND |
-| `CDK_SECRET` | Stable random secret, minimum 32 characters |
-| `ADMIN_ID` | Telegram numeric user ID allowed to generate admin CDKs |
+| `BOT_TOKEN` | Token bot Telegram (BotFather) |
+| `ADMIN_ID` | Telegram user ID của admin |
+| `REVENUECAT_APP_KEY` | RevenueCat secret key — dùng cho check status và alias |
+| `SEPAY_API_TOKEN` | SePay API token để đối soát chuyển khoản |
+| `BANK_BIN`, `BANK_ACCOUNT`, `BANK_NAME`, `BANK_OWNER` | Thông tin nhận tiền VietQR |
+| `CDK_UNIT_PRICE` | Giá key gói Vĩnh Viễn (VND) |
+| `CDK_UNIT_PRICE_1Y` | Giá key 1 năm cho admin (`/genkey 1y`), tùy chọn |
+| `FREE_REACTIVATE_COOLDOWN_MINUTES` | Chờ giữa 2 lần kích hoạt lại miễn phí (mặc định 30) |
+| `FREE_REACTIVATE_DAILY_MAX` | Số lần kích hoạt lại miễn phí / 1 khách / ngày (mặc định 5) |
+| `CDK_SECRET` | Secret ≥32 ký tự để sinh key an toàn |
+| `GOLD_MIN_SOURCE_DAYS` | Ngưỡng ngày tối thiểu giữ nguồn (mặc định 10) |
+| `CHK_PROXY_URL` | Proxy riêng cho `/chk` (tùy chọn) |
+| `WEB_HOST`, `WEB_PORT` | Địa chỉ web store |
+| `WEB_ADMIN_USER`, `WEB_ADMIN_PASSWORD_HASH` | Tài khoản admin web |
+| `WEB_SESSION_SECRET` | Khóa ký session web (mặc định dùng `CDK_SECRET`) |
 
-Required for the web store (`web_store.py`):
-
-| Variable | Meaning |
-| :--- | :--- |
-| `WEB_HOST` | Bind address (default `0.0.0.0`) |
-| `WEB_PORT` | Web store port (default `8080`) |
-| `WEB_ADMIN_USER` | Admin panel username (default `admin`) |
-| `WEB_ADMIN_PASSWORD` | Admin panel password — required to enable login |
-| `WEB_SESSION_SECRET` | Optional session signing key; falls back to `CDK_SECRET` |
-
-Generate `CDK_SECRET` once and keep it stable:
+Tạo secret:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Changing `CDK_SECRET` makes secure CDKs generated under the old secret
-unverifiable. Existing legacy `LOCK-XXXX` rows remain compatible.
+### Kho nguồn
 
-Do not put tokens or credentials in source code. Provide `BOT_TOKEN`,
-`NEXTDNS_KEYS`, `REVENUECAT_APP_KEY`, and `TOKEN_SETS_JSON` through your
-deployment secret manager, and rotate any credential that has previously been
-committed.
+Kho nguồn lưu trong SQLite (`gold_sources`). Lần đầu chạy, nếu có file
+`current_source.txt` ở thư mục gốc, bot/web sẽ tự import:
 
----
+```
+# DANH SÁCH NGUỒN LOCKET GOLD
+# FORMAT: STT | USERNAME | SỐ LẦN ĐÃ KÍCH (TỐI ĐA 5 LẦN) | EXPIRES
+1 | username | 0 | expires: 2027-08-02 20:39:51 (còn 314 ngày)
+```
 
-## 🎮 Commands
-
-Commands are registered via `set_my_commands` (shown in the `/` menu and the **Menu Button** next to the input field). Users see the base list; the admin gets the extended list via a chat-specific scope.
-
-### User Commands
-Use these commands in your Telegram bot:
-
-| Command | Usage | Description |
-| :--- | :--- | :--- |
-| `/start` | - | Initialize the bot and show the main menu. |
-| `/menu` | - | Re-open the main menu + quick keyboard. |
-| `/muacdk` | - | Buy 1-5 CDKs and receive a VietQR/SePay payment order. |
-| `/setlang` | - | Switch between English 🇺🇸 and Vietnamese 🇻🇳. |
-| `/help` | - | View detailed help and instructions. |
-| **Direct Message** | `username` | Send any Locket username or link to queue an upgrade. |
-
-### Admin Commands (👑)
-Restricted to the `ADMIN_ID` provided through the environment (shown only to the admin in the `/` menu).
-
-| Command | Usage | Description |
-| :--- | :--- | :--- |
-| `/stats` | - | View **Queue Size**, Active Workers, and System Health. |
-| `/noti` | `/noti <msg>` | Broadcast a message to **all** bot users. |
-| `/rs` | `/rs <id>` | Reset the daily limit for a specific user ID. |
-| `/setdonate` | Reply to photo | Set the custom "Success" image shown after activation. |
-| `/setvideo` | Reply to video | Set the guide video shown in the menu. |
-
-### 🌐 Web Store (`web_store.py`)
-
-A separate sales front running alongside the bot (started automatically by
-`run.sh`, or manually with `./venv/bin/python3 web_store.py`):
-
-*   **Storefront** (`/`) — product showcase, quantity selector, buy flow with
-    VietQR payment. CDK codes are delivered automatically once the bank
-    transfer is confirmed through SePay.
-*   **Verify page** (`/verify`) — paste a CDK to check whether it is valid,
-    already used, or unknown, so buyers can confirm their purchase.
-*   **Admin panel** (`/admin`) — separate username/password login
-    (`WEB_ADMIN_USER` / `WEB_ADMIN_PASSWORD`), showing revenue, order lists,
-    CDK inventory, and CDK generation.
-
-Web orders live in the same `cdk_orders` table and are completed by the web
-store's own SePay poller; the bot skips orders that have no Telegram chat.
-Enable the admin panel by setting `WEB_ADMIN_PASSWORD` in `.env`.
-
-### ⌨️ Quick Reply Keyboard
-`/start` and `/menu` attach a persistent Reply Keyboard below the input field. Each button maps to the same action as the inline menu button (Input User / Block DNS / Guide / Language / Help / Generate CDK for admin) — no typing needed.
-
-### 🔘 Inline Keyboards
-Inline buttons (menu, language picker, upgrade confirm, back) are shown below bot messages and edit in place without sending messages to the chat.
-
-### 🧭 Menu Button
-The bot's menu button (next to the input field) is set to `MenuButtonCommands`, so tapping it opens the full command list with descriptions.
+Thêm nguồn nhanh: `/set https://locket.cam/username` (bot) hoặc trang
+**Nguồn Gold** trong admin web.
 
 ---
 
-## 📊 System Architecture
+## 📊 Kiến trúc
 
 ```mermaid
-graph TD
-    User([👤 User]) -->|Sends Username| Bot
-    
-    subgraph "🤖 Bot Core (AsyncIO)"
-        Bot[Telegram Handler] -->|Enqueue| Queue[FIFO Queue]
-        Queue -->|1. Pop Request| Worker[👱 Worker Thread]
-    end
-    
-    subgraph "☁️ External APIs"
-        Worker -->|2. Inject Token| RC[RevenueCat API]
-        Worker -->|3. Create Profile| NextDNS[NextDNS API]
-    end
-    
-    RC -- 200 OK --> Worker
-    NextDNS -- Profile Link --> Worker
-    
-    Worker -->|4. Success Message| Bot
-    Bot -->|5. Notify User| User
+graph LR
+    User([👤 Khách]) -->|/nap| Pay[VietQR / SePay]
+    Pay -->|đối soát| Key[🎟️ Key]
+    Key -->|/redeem key link| Alias[RevenueCat Alias]
+    User -->|web| Alias
+    Pool[(🗂️ Kho nguồn\n5 lượt/nguồn)] --> Alias
+    Alias -->|Gold| Dest([👑 Tài khoản đích])
+    Scan[/scan TikTok/] --> Pool
+    Chk[/chk .txt/] --> Pool
+```
+
+---
+
+## 🧪 Tests
+
+```bash
+./venv/bin/python3 -m unittest discover -s tests
 ```
 
 ---
 
 ## ⚠️ Disclaimer
 
-> **This project is for EDUCATIONAL and RESEARCH purposes only.**  
-> The author is not responsible for any misuse of this software. By using this tool, you agree to take full responsibility for your actions. "Locket Widget" and "RevenueCat" are trademarks of their respective owners.
-
----
+> **Dự án chỉ dành cho mục đích học tập và nghiên cứu.** Tác giả không chịu
+> trách nhiệm cho bất kỳ hành vi sử dụng sai mục đích nào. "Locket Widget" và
+> "RevenueCat" là thương hiệu của chủ sở hữu tương ứng.
 
 <div align="center">
-
-**[ Report Bug ](https://github.com/zero3041/Locket-Gold/issues) • [ Request Feature ](https://github.com/zero3041/Locket-Gold/issues)**
 
 Maintained by [zero3041](https://github.com/zero3041)
 

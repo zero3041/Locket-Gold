@@ -3,7 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aiohttp import web
 
@@ -24,6 +24,7 @@ class WebStoreAppTest(unittest.IsolatedAsyncioTestCase):
         db.init_db()
 
         web_store.CDK_UNIT_PRICE = 50000
+        web_store.CDK_UNIT_PRICE_1Y = 200000
         web_store.CDK_SECRET = SECRET
         web_store.BANK_BIN = "970418"
         web_store.BANK_ACCOUNT = "1234567890"
@@ -35,7 +36,6 @@ class WebStoreAppTest(unittest.IsolatedAsyncioTestCase):
         web_store.WEB_ADMIN_PASSWORD_HASH = ""
         web_store.WEB_SESSION_SECRET = SECRET
         web_store.payment_config_errors = lambda: []
-        web_store._complete_web_order = lambda order_id: None
 
         async def _noop_complete(order_id):
             return None
@@ -65,16 +65,27 @@ class WebStoreAppTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200, resp.status)
         self.assertIn("Locket Gold", body)
         self.assertIn("Kích hoạt Gold", body)
+        self.assertNotIn("dns", body.lower())
 
     async def test_verify_page_and_api(self):
         from aiohttp import ClientSession
-        codes = db.gen_cdk(1, admin_id=0, cdk_secret=SECRET)
+        codes = db.gen_cdk(1, admin_id=0, cdk_secret=SECRET, plan="1y", spins=3)
         async with ClientSession() as session:
             async with session.post(f"{self.base}/api/verify", json={"code": codes[0]}) as resp:
                 data = await resp.json()
         self.assertEqual("valid", data["status"])
+        self.assertEqual("1y", data["plan"])
+        self.assertEqual(3, data["spins_left"])
 
-        db.redeem_cdk(codes[0], user_id=99, secret=SECRET)
+        db.consume_key(codes[0], user_id=99, secret=SECRET)
+        async with ClientSession() as session:
+            async with session.post(f"{self.base}/api/verify", json={"code": codes[0]}) as resp:
+                data = await resp.json()
+        self.assertEqual("valid", data["status"])
+        self.assertEqual(2, data["spins_left"])
+
+        for _ in range(2):
+            db.consume_key(codes[0], user_id=99, secret=SECRET)
         async with ClientSession() as session:
             async with session.post(f"{self.base}/api/verify", json={"code": codes[0]}) as resp:
                 data = await resp.json()
@@ -110,7 +121,6 @@ class WebStoreAppTest(unittest.IsolatedAsyncioTestCase):
             m = re.search(r'name="csrf" value="([0-9a-f]+)"', body)
             self.assertIsNotNone(m)
 
-            # Wrong password fails even with a valid CSRF token.
             async with session.post(
                 f"{self.base}/admin/login",
                 data={"username": "admin", "password": "wrong", "csrf": m.group(1)},
@@ -118,7 +128,6 @@ class WebStoreAppTest(unittest.IsolatedAsyncioTestCase):
                 body = await resp.text()
                 self.assertIn("Sai tên đăng nhập", body)
 
-            # Missing CSRF token is rejected.
             async with session.post(
                 f"{self.base}/admin/login",
                 data={"username": "admin", "password": "s3cret-pass"},
@@ -141,19 +150,18 @@ class WebStoreAppTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(302, resp.status)
                 self.assertIn("/admin/login", resp.headers.get("Location", ""))
 
-    async def test_admin_generate_cdk_requires_csrf(self):
+    async def test_admin_generate_keys_requires_csrf(self):
         from aiohttp import ClientSession, CookieJar
         jar = CookieJar(unsafe=True)
         async with ClientSession(cookie_jar=jar) as session:
             token = await self._admin_login(session)
 
-            # Without the CSRF header the request is rejected.
-            async with session.post(f"{self.base}/admin/cdks/generate", json={"count": 5}) as resp:
+            async with session.post(f"{self.base}/admin/keys/generate", json={"count": 5}) as resp:
                 self.assertEqual(403, resp.status)
 
             async with session.post(
-                f"{self.base}/admin/cdks/generate",
-                json={"count": 5},
+                f"{self.base}/admin/keys/generate",
+                json={"count": 5, "spins": 2, "plan": "1y"},
                 headers={"X-CSRF-Token": token},
             ) as resp:
                 data = await resp.json()
@@ -161,13 +169,54 @@ class WebStoreAppTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(5, len(data["codes"]))
             for code in data["codes"]:
                 self.assertTrue(db.validate_cdk(code, secret=SECRET))
+            detail = db.get_cdk_detail(data["codes"][0], secret=SECRET)
+            self.assertEqual("1y", detail["plan"])
+            self.assertEqual(2, detail["spins_left"])
+
+    async def test_admin_sources_add_remove_and_cleanup(self):
+        from aiohttp import ClientSession, CookieJar
+        jar = CookieJar(unsafe=True)
+        async with ClientSession(cookie_jar=jar) as session:
+            token = await self._admin_login(session)
+
+            async def fake_check_source(source, probe=False, proxy_url=None):
+                return {
+                    "username": source["username"], "status": "usable",
+                    "uid": "U" * 28, "days_left": 200,
+                    "expires": "2030-01-01 00:00:00",
+                }
+
+            with patch.object(web_store.activation, "check_source", new=AsyncMock(side_effect=fake_check_source)):
+                async with session.post(
+                    f"{self.base}/admin/sources/add",
+                    json={"username": "https://locket.cam/goldsrc"},
+                    headers={"X-CSRF-Token": token},
+                ) as resp:
+                    data = await resp.json()
+            self.assertTrue(data["ok"], data)
+            self.assertEqual("goldsrc", data["username"])
+            self.assertIn("goldsrc", [s["username"] for s in db.list_gold_sources()])
+
+            # CSRF is required.
+            async with session.post(
+                f"{self.base}/admin/sources/remove", json={"username": "goldsrc"}
+            ) as resp:
+                self.assertEqual(403, resp.status)
+
+            async with session.post(
+                f"{self.base}/admin/sources/remove",
+                json={"username": "goldsrc"},
+                headers={"X-CSRF-Token": token},
+            ) as resp:
+                data = await resp.json()
+            self.assertTrue(data["ok"])
+            self.assertEqual([], db.list_gold_sources())
 
     async def test_admin_password_hash_verification(self):
         import web_store
         import base64
         import hashlib
 
-        # Hash round-trips against _verify_admin_password.
         salt = b"fixed-salt-123456"
         digest = hashlib.pbkdf2_hmac("sha256", b"hunter2", salt, 1000)
         web_store.WEB_ADMIN_PASSWORD = ""
@@ -180,10 +229,8 @@ class WebStoreAppTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(web_store._verify_admin_password("hunter2"))
         self.assertFalse(web_store._verify_admin_password("wrong"))
         self.assertFalse(web_store._verify_admin_password(""))
-        # Malformed hash never verifies.
         web_store.WEB_ADMIN_PASSWORD_HASH = "pbkdf2$not-an-int$xx$yy"
         self.assertFalse(web_store._verify_admin_password("hunter2"))
-        # Legacy plaintext fallback still works.
         web_store.WEB_ADMIN_PASSWORD_HASH = ""
         web_store.WEB_ADMIN_PASSWORD = "legacy-pass"
         self.assertTrue(web_store._verify_admin_password("legacy-pass"))
@@ -203,199 +250,210 @@ class WebStoreAppTest(unittest.IsolatedAsyncioTestCase):
     async def test_api_check_resolves_profile_and_status(self):
         from aiohttp import ClientSession
         import web_store
-        import asyncio
 
-        async def fake_resolve(username):
+        async def fake_resolve(username, proxy_url=None):
             return {"uid": "UID-XYZ", "avatar": "//cdn.example/av.jpg"}
 
-        async def fake_status(uid):
+        async def fake_status(uid, proxy_url=None):
             return {"active": False}
 
-        original_resolve = web_store.locket.resolve_profile
-        original_status = web_store.locket.check_status
-        web_store.locket.resolve_profile = fake_resolve
-        web_store.locket.check_status = fake_status
-        try:
+        with (
+            patch.object(web_store.locket, "resolve_profile", new=AsyncMock(side_effect=fake_resolve)),
+            patch.object(web_store.locket, "check_status", new=AsyncMock(side_effect=fake_status)),
+        ):
             async with ClientSession() as session:
                 async with session.post(f"{self.base}/api/check", json={"username": "alice"}) as resp:
                     data = await resp.json()
-            self.assertTrue(data["ok"])
-            self.assertEqual("UID-XYZ", data["uid"])
-            self.assertEqual("alice", data["username"])
-            self.assertEqual("https://cdn.example/av.jpg", data["avatar"])
-            self.assertFalse(data["gold_active"])
-            self.assertFalse(data["paid"])
-            self.assertIsNone(data["activation"])
+                self.assertTrue(data["ok"])
+                self.assertEqual("UID-XYZ", data["uid"])
+                self.assertEqual("alice", data["username"])
+                self.assertEqual("https://cdn.example/av.jpg", data["avatar"])
+                self.assertFalse(data["gold_active"])
 
-            async with ClientSession() as session:
                 async with session.post(
-                    f"{self.base}/api/check",
-                    json={"username": "https://locket.cam/bob"},
+                    f"{self.base}/api/check", json={"username": "https://locket.cam/bob"}
                 ) as resp:
                     data = await resp.json()
-            self.assertEqual("bob", data["username"])
-        finally:
-            web_store.locket.resolve_profile = original_resolve
-            web_store.locket.check_status = original_status
-
-    async def test_api_check_reports_saved_activation(self):
-        from aiohttp import ClientSession
-        import web_store
-
-        async def fake_resolve(username):
-            return {"uid": "UID-ACT-1", "avatar": None}
-
-        async def fake_status(uid):
-            return {"active": False}
-
-        original_resolve = web_store.locket.resolve_profile
-        original_status = web_store.locket.check_status
-        web_store.locket.resolve_profile = fake_resolve
-        web_store.locket.check_status = fake_status
-        act_id = None
-        try:
-            async with ClientSession() as session:
-                async with session.post(
-                    f"{self.base}/api/check",
-                    json={"username": "veteran"},
-                ) as resp:
-                    data = await resp.json()
-            self.assertTrue(data["ok"])
-            self.assertIsNone(data["activation"])
-
-            act_id = web_store.db.create_web_activation(
-                None, 424242, "UID-ACT-1", "veteran", status="queued",
-            )
-            web_store.db.update_web_activation(
-                act_id,
-                status="success",
-                cdk_code="LOCK-OLD-CODE-1",
-                dns_link="101.1.1.1",
-                result="Đã kích hoạt thành công",
-            )
-            async with ClientSession() as session:
-                async with session.post(
-                    f"{self.base}/api/check",
-                    json={"username": "veteran"},
-                ) as resp:
-                    data = await resp.json()
-            self.assertEqual("success", data["activation"]["status"])
-            self.assertEqual("LOCK-OLD-CODE-1", data["activation"]["cdk_code"])
-            self.assertEqual("101.1.1.1", data["activation"]["dns_link"])
-        finally:
-            if act_id is not None:
-                web_store.db.delete_web_activation(act_id)
-            web_store.locket.resolve_profile = original_resolve
-            web_store.locket.check_status = original_status
+                self.assertEqual("bob", data["username"])
 
     async def test_api_check_not_found(self):
         from aiohttp import ClientSession
         import web_store
 
-        original = web_store.locket.resolve_profile
-        async def _missing(username):
-            return None
-        web_store.locket.resolve_profile = _missing
-        try:
+        with patch.object(web_store.locket, "resolve_profile", new=AsyncMock(return_value=None)):
             async with ClientSession() as session:
                 async with session.post(f"{self.base}/api/check", json={"username": "ghost"}) as resp:
                     data = await resp.json()
-            self.assertEqual(404, resp.status)
-            self.assertFalse(data["ok"])
-        finally:
-            web_store.locket.resolve_profile = original
+        self.assertEqual(404, resp.status)
+        self.assertFalse(data["ok"])
 
-    async def test_api_activate_paid_and_free_flow(self):
+    async def test_api_create_order_uses_plan_price(self):
         from aiohttp import ClientSession
-        db.mark_uid_paid("UID-PAID", order_id=999)
-
-        # Free re-activation: no order, straight to queued.
         async with ClientSession() as session:
-            async with session.post(
-                f"{self.base}/api/activate",
-                json={"uid": "UID-PAID", "username": "veteran"},
-            ) as resp:
+            async with session.post(f"{self.base}/api/order", json={"plan": "1y", "quantity": 2}) as resp:
                 data = await resp.json()
-        self.assertTrue(data["ok"])
-        self.assertTrue(data["free"])
-        act = db.get_web_activation(id=data["activation_id"])
-        self.assertEqual("queued", act["status"])
-        self.assertIsNone(act["order_id"])
-
-        # Paid flow: creates order + awaiting_payment activation.
-        async with ClientSession() as session:
-            async with session.post(
-                f"{self.base}/api/activate",
-                json={"uid": "UID-NEW", "username": "fresh"},
-            ) as resp:
-                data = await resp.json()
-        self.assertTrue(data["ok"])
-        self.assertFalse(data["free"])
+        self.assertTrue(data["ok"], data)
         order = db.get_cdk_order(id=data["order_id"])
-        self.assertEqual("pending", order["status"])
-        act = db.get_web_activation(order_id=data["order_id"])
-        self.assertEqual("awaiting_payment", act["status"])
-        self.assertEqual("UID-NEW", act["uid"])
+        self.assertEqual("1y", order["plan"])
+        self.assertEqual(2 * web_store.CDK_UNIT_PRICE_1Y, order["total_price"])
 
-        # Payment confirmed: activation moves to 'paid', NOT queued yet.
-        db.update_web_activation(act["id"], status="paid", cdk_code="LOCK-PAID-1")
-        db.mark_uid_paid("UID-NEW", order_id=data["order_id"])
-        act = db.get_web_activation(id=act["id"])
-        self.assertEqual("paid", act["status"])
-
-        # /start flips paid -> queued so the bot worker picks it up.
         async with ClientSession() as session:
-            async with session.post(f"{self.base}/api/order/{data['order_id']}/start") as resp:
-                start_data = await resp.json()
-        self.assertTrue(start_data["ok"])
-        self.assertEqual("queued", start_data["status"])
-        act = db.get_web_activation(id=act["id"])
-        self.assertEqual("queued", act["status"])
+            async with session.post(f"{self.base}/api/order", json={"plan": "bad"}) as resp:
+                self.assertEqual(400, resp.status)
+            async with session.post(f"{self.base}/api/order", json={"plan": "1m", "quantity": 9}) as resp:
+                self.assertEqual(400, resp.status)
 
-    async def test_api_activation_status_polls(self):
+    async def test_landing_shows_single_permanent_product(self):
         from aiohttp import ClientSession
-        act_id = db.create_web_activation(None, visitor_id=-5, uid="UID-POLL", username="poll", status="queued")
         async with ClientSession() as session:
-            async with session.get(f"{self.base}/api/activation/{act_id}") as resp:
-                data = await resp.json()
-        self.assertEqual("queued", data["status"])
-        self.assertEqual("poll", data["username"])
+            async with session.get(f"{self.base}/") as resp:
+                body = await resp.text()
+        self.assertIn("Gói Vĩnh Viễn", body)
+        self.assertIn("Kích hoạt lại miễn phí", body)
+        self.assertIn("rớt", body.lower())
+        self.assertNotIn("Gói 1 Năm", body)
 
-    async def test_api_activate_cdk_flow(self):
+    async def test_api_check_reports_reactivation_eligibility(self):
         from aiohttp import ClientSession
         import web_store
-        codes = db.gen_cdk(1, admin_id=1, secret=web_store.CDK_SECRET)
-        cdk_code = codes[0]
-        async with ClientSession() as session:
-            async with session.post(
-                f"{self.base}/api/activate-cdk",
-                json={"uid": "UID-CDK", "username": "cdkuser", "code": cdk_code},
-            ) as resp:
-                data = await resp.json()
-        self.assertTrue(data["ok"])
-        self.assertTrue(data["free"])
-        self.assertIn("activation_id", data)
-        act = db.get_web_activation(id=data["activation_id"])
-        self.assertEqual("queued", act["status"])
-        self.assertIsNone(act["order_id"])
-        self.assertEqual(cdk_code, act["cdk_code"])
-        self.assertTrue(db.is_uid_paid("UID-CDK"))
 
-        # Same CDK cannot be reused while reserved.
-        async with ClientSession() as session:
-            async with session.post(
-                f"{self.base}/api/activate-cdk",
-                json={"uid": "UID-CDK2", "username": "cdkuser2", "code": cdk_code},
-            ) as resp:
-                data2 = await resp.json()
-        self.assertFalse(data2["ok"])
+        uid = "R" * 28
 
-        # Invalid CDK is rejected.
-        async with ClientSession() as session:
-            async with session.post(
-                f"{self.base}/api/activate-cdk",
-                json={"uid": "UID-CDK3", "username": "cdkuser3", "code": "LOCK-NOPE-1"},
-            ) as resp:
-                data3 = await resp.json()
-        self.assertFalse(data3["ok"])
-        self.assertFalse(db.is_uid_paid("UID-CDK3"))
+        async def fake_resolve(username, proxy_url=None):
+            return {"uid": uid, "avatar": None}
+
+        async def fake_status(check_uid, proxy_url=None):
+            return {"active": False, "expires": "Unknown"}
+
+        with (
+            patch.object(web_store.locket, "resolve_profile", new=AsyncMock(side_effect=fake_resolve)),
+            patch.object(web_store.locket, "check_status", new=AsyncMock(side_effect=fake_status)),
+        ):
+            async with ClientSession() as session:
+                async with session.post(f"{self.base}/api/check", json={"username": "veteran"}) as resp:
+                    data = await resp.json()
+                self.assertFalse(data["can_reactivate"])
+
+                db.mark_uid_activated(uid, when=0)
+                async with session.post(f"{self.base}/api/check", json={"username": "veteran"}) as resp:
+                    data = await resp.json()
+                self.assertTrue(data["can_reactivate"])
+
+    async def test_api_reactivate_requires_previous_activation(self):
+        from aiohttp import ClientSession
+        import web_store
+        with patch.object(web_store.locket, "resolve_uid", new=AsyncMock(return_value="X" * 28)):
+            async with ClientSession() as session:
+                async with session.post(f"{self.base}/api/reactivate", json={"username": "nobody"}) as resp:
+                    data = await resp.json()
+        self.assertEqual(403, resp.status)
+        self.assertFalse(data["ok"])
+
+    async def test_api_reactivate_success_then_cooldown(self):
+        from aiohttp import ClientSession
+        import web_store
+
+        uid = "Y" * 28
+        db.mark_uid_activated(uid, when=0)
+        result = {
+            "ok": True, "code": "ok", "message": "done",
+            "uid": uid, "expires": "2027-01-01 00:00:00", "days_left": 100,
+            "source": "sourceuser", "source_used": 1,
+        }
+        with (
+            patch.object(web_store.locket, "resolve_uid", new=AsyncMock(return_value=uid)),
+            patch.object(web_store.activation, "activate", new=AsyncMock(return_value=result)) as activate,
+        ):
+            async with ClientSession() as session:
+                async with session.post(f"{self.base}/api/reactivate", json={"username": "veteran"}) as resp:
+                    data = await resp.json()
+                self.assertTrue(data["ok"], data)
+                self.assertTrue(data["free"])
+                activate.assert_awaited_once()
+
+                # Immediately after a successful re-activation the cooldown applies.
+                async with session.post(f"{self.base}/api/reactivate", json={"username": "veteran"}) as resp:
+                    data2 = await resp.json()
+                self.assertEqual(429, resp.status)
+                self.assertFalse(data2["ok"])
+
+                # Cooldown is 0 in tests -> allow again if configured that way.
+                with patch.object(web_store, "FREE_REACTIVATE_COOLDOWN_MINUTES", 0):
+                    async with session.post(f"{self.base}/api/reactivate", json={"username": "veteran"}) as resp:
+                        data3 = await resp.json()
+                self.assertTrue(data3["ok"], data3)
+
+    async def test_api_redeem_marks_uid_for_free_reactivation(self):
+        from aiohttp import ClientSession
+        import web_store
+        codes = db.gen_cdk(1, admin_id=1, cdk_secret=SECRET, plan="1m", spins=1)
+        uid = "Z" * 28
+        result = {
+            "ok": True, "code": "ok", "message": "done",
+            "uid": uid, "expires": "2027-01-01 00:00:00", "days_left": 100,
+            "source": "sourceuser", "source_used": 1,
+        }
+        with patch.object(web_store.activation, "activate", new=AsyncMock(return_value=result)):
+            async with ClientSession() as session:
+                async with session.post(
+                    f"{self.base}/api/redeem", json={"code": codes[0], "username": "alice"}
+                ) as resp:
+                    data = await resp.json()
+        self.assertTrue(data["ok"], data)
+        self.assertIsNotNone(db.get_uid_activation(uid))
+
+    async def test_api_redeem_rejects_unknown_key(self):
+        from aiohttp import ClientSession
+        with patch.object(web_store.activation, "activate", new=AsyncMock()) as activate:
+            async with ClientSession() as session:
+                async with session.post(
+                    f"{self.base}/api/redeem", json={"code": "LK-NOPE", "username": "alice"}
+                ) as resp:
+                    data = await resp.json()
+        self.assertEqual(400, resp.status)
+        self.assertFalse(data["ok"])
+        activate.assert_not_awaited()
+
+    async def test_api_redeem_refunds_spin_when_activation_fails(self):
+        from aiohttp import ClientSession
+        codes = db.gen_cdk(1, admin_id=1, cdk_secret=SECRET, plan="1m", spins=1)
+        with patch.object(
+            web_store.activation, "activate",
+            new=AsyncMock(return_value={"ok": False, "code": "no_source", "message": "empty"}),
+        ):
+            async with ClientSession() as session:
+                async with session.post(
+                    f"{self.base}/api/redeem", json={"code": codes[0], "username": "alice"}
+                ) as resp:
+                    data = await resp.json()
+        self.assertEqual(400, resp.status)
+        self.assertTrue(data["refunded"])
+        detail = db.get_cdk_detail(codes[0], secret=SECRET)
+        self.assertEqual(1, detail["spins_left"])
+        self.assertEqual("valid", detail["status"])
+
+    async def test_api_redeem_success_logs_history(self):
+        from aiohttp import ClientSession
+        codes = db.gen_cdk(1, admin_id=1, cdk_secret=SECRET, plan="1m", spins=1)
+        result = {
+            "ok": True, "code": "ok", "message": "done",
+            "uid": "U" * 28, "expires": "2027-01-01 00:00:00", "days_left": 100,
+            "source": "sourceuser", "source_used": 1,
+        }
+        with patch.object(web_store.activation, "activate", new=AsyncMock(return_value=result)) as activate:
+            async with ClientSession() as session:
+                async with session.post(
+                    f"{self.base}/api/redeem", json={"code": codes[0], "username": "alice"}
+                ) as resp:
+                    data = await resp.json()
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(0, data["spins_left"])
+        activate.assert_awaited_once()
+        detail = db.get_cdk_detail(codes[0], secret=SECRET)
+        self.assertEqual("used", detail["status"])
+        history = db.list_key_redemptions(limit=5)
+        self.assertTrue(any(row["target"] == "alice" for row in history))
+
+
+if __name__ == "__main__":
+    unittest.main()
